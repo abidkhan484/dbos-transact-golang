@@ -1335,6 +1335,26 @@ func TestChildWorkflow(t *testing.T) {
 		require.NoError(t, err, "failed to execute grand parent workflow")
 		_, err = h.GetResult()
 		require.NoError(t, err, "failed to get result from grand parent workflow")
+
+		// Verify ParentWorkflowID along the chain: grandparent -> parent -> child
+		grandParentID := h.GetWorkflowID()
+		grandParentStatus, err := h.GetStatus()
+		require.NoError(t, err, "failed to get grandparent workflow status")
+		require.Empty(t, grandParentStatus.ParentWorkflowID, "top-level grandparent should have no ParentWorkflowID")
+
+		parentID := fmt.Sprintf("%s-0", grandParentID)
+		parentHandle, err := RetrieveWorkflow[string](dbosCtx, parentID)
+		require.NoError(t, err, "failed to retrieve parent workflow")
+		parentStatus, err := parentHandle.GetStatus()
+		require.NoError(t, err, "failed to get parent workflow status")
+		require.Equal(t, grandParentID, parentStatus.ParentWorkflowID, "parent workflow ParentWorkflowID should be grandparent's ID")
+
+		childID := fmt.Sprintf("%s-0", parentID)
+		childHandle, err := RetrieveWorkflow[string](dbosCtx, childID)
+		require.NoError(t, err, "failed to retrieve child workflow")
+		childStatus, err := childHandle.GetStatus()
+		require.NoError(t, err, "failed to get child workflow status")
+		require.Equal(t, parentID, childStatus.ParentWorkflowID, "child workflow ParentWorkflowID should be parent's ID")
 	})
 
 	t.Run("ChildWorkflowWithCustomID", func(t *testing.T) {
@@ -1361,6 +1381,17 @@ func TestChildWorkflow(t *testing.T) {
 		require.Equal(t, 1, steps[1].StepID)
 		require.Equal(t, "DBOS.getResult", steps[1].StepName)
 		require.Equal(t, customChildID, steps[1].ChildWorkflowID)
+
+		// Verify ParentWorkflowID: parent has none, child has parent's ID
+		parentStatus, err := parentHandle.GetStatus()
+		require.NoError(t, err, "failed to get parent workflow status")
+		require.Empty(t, parentStatus.ParentWorkflowID, "top-level parent workflow should have no ParentWorkflowID")
+
+		childHandle, err := RetrieveWorkflow[string](dbosCtx, customChildID)
+		require.NoError(t, err, "failed to retrieve child workflow")
+		childStatus, err := childHandle.GetStatus()
+		require.NoError(t, err, "failed to get child workflow status")
+		require.Equal(t, parentHandle.GetWorkflowID(), childStatus.ParentWorkflowID, "child workflow ParentWorkflowID should be parent's workflow ID")
 	})
 
 	t.Run("RecoveredChildWorkflowPollingHandle", func(t *testing.T) {
@@ -4524,8 +4555,10 @@ func TestWorkflowHandles(t *testing.T) {
 	dbosCtx := setupDBOS(t, setupDBOSOptions{dropDB: true, checkLeaks: true})
 	RegisterWorkflow(dbosCtx, slowWorkflow)
 
+	workflowSleep := 1 * time.Second
+
 	t.Run("WorkflowHandleTimeout", func(t *testing.T) {
-		handle, err := RunWorkflow(dbosCtx, slowWorkflow, 10*time.Second)
+		handle, err := RunWorkflow(dbosCtx, slowWorkflow, workflowSleep)
 		require.NoError(t, err, "failed to start workflow")
 
 		start := time.Now()
@@ -4541,7 +4574,7 @@ func TestWorkflowHandles(t *testing.T) {
 
 	t.Run("WorkflowPollingHandleTimeout", func(t *testing.T) {
 		// Start a workflow that will block on the first signal
-		originalHandle, err := RunWorkflow(dbosCtx, slowWorkflow, 10*time.Second)
+		originalHandle, err := RunWorkflow(dbosCtx, slowWorkflow, workflowSleep)
 		require.NoError(t, err, "failed to start workflow")
 
 		pollingHandle, err := RetrieveWorkflow[string](dbosCtx, originalHandle.GetWorkflowID())
@@ -4550,8 +4583,11 @@ func TestWorkflowHandles(t *testing.T) {
 		_, ok := pollingHandle.(*workflowPollingHandle[string])
 		require.True(t, ok, "expected polling handle, got %T", pollingHandle)
 
+		start := time.Now()
 		_, err = pollingHandle.GetResult(WithHandleTimeout(10*time.Millisecond), WithHandlePollingInterval(1*time.Millisecond))
+		duration := time.Since(start)
 
+		assert.True(t, duration < 100*time.Millisecond, "timeout should occur quickly")
 		require.Error(t, err, "expected timeout error")
 		assert.True(t, errors.Is(err, context.DeadlineExceeded),
 			"expected error to be detectable as context.DeadlineExceeded, got: %v", err)
@@ -4637,6 +4673,7 @@ func TestPatching(t *testing.T) {
 		}
 
 		RegisterWorkflow(dbosCtx, wf, WithWorkflowName("wf"))
+		require.NoError(t, Launch(dbosCtx))
 
 		handle, err := RunWorkflow(dbosCtx, wf, 1)
 		require.NoError(t, err, "failed to start workflow")
@@ -4681,10 +4718,11 @@ func TestPatching(t *testing.T) {
 		}
 
 		// (hack) Clear the context registry and re-gister the patched wf with the same name
+		dbosCtx.(*dbosContext).launched.Store(false)
 		dbosCtx.(*dbosContext).workflowRegistry.Clear()
 		dbosCtx.(*dbosContext).workflowCustomNametoFQN.Clear()
 		RegisterWorkflow(dbosCtx, wfPatched, WithWorkflowName("wf"))
-		dbosCtx.Launch()
+		dbosCtx.(*dbosContext).launched.Store(true)
 
 		// new invocation takes the new code and has the patch step recorded
 		patchedHandle, err := RunWorkflow(dbosCtx, wfPatched, 1)
@@ -4744,6 +4782,7 @@ func TestPatching(t *testing.T) {
 		dbosCtx.(*dbosContext).workflowCustomNametoFQN.Clear()
 		dbosCtx.(*dbosContext).launched.Store(false)
 		RegisterWorkflow(dbosCtx, wfDeprecatePatch, WithWorkflowName("wf"))
+		dbosCtx.(*dbosContext).launched.Store(true)
 
 		// deprecated invocation skips the patch deprecation entirely
 		deprecatedHandle, err := RunWorkflow(dbosCtx, wfDeprecatePatch, 1)

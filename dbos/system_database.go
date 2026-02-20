@@ -161,6 +161,9 @@ var migration6SQL string
 //go:embed migrations/7_add_owner_xid.sql
 var migration7SQL string
 
+//go:embed migrations/8_add_parent_workflow_id.sql
+var migration8SQL string
+
 type migrationFile struct {
 	version int64
 	sql     string
@@ -216,6 +219,8 @@ func runMigrations(ctx context.Context, pool *pgxpool.Pool, schema string, isCoc
 
 	migration7SQLProcessed := fmt.Sprintf(migration7SQL, sanitizedSchema)
 
+	migration8SQLProcessed := fmt.Sprintf(migration8SQL, sanitizedSchema, sanitizedSchema)
+
 	// Build migrations list with processed SQL
 	migrations := []migrationFile{
 		{version: 1, sql: migration1SQLProcessed},
@@ -225,6 +230,7 @@ func runMigrations(ctx context.Context, pool *pgxpool.Pool, schema string, isCoc
 		{version: 5, sql: migration5SQLProcessed},
 		{version: 6, sql: migration6SQLProcessed},
 		{version: 7, sql: migration7SQLProcessed},
+		{version: 8, sql: migration8SQLProcessed},
 	}
 
 	// Begin transaction for atomic migration execution
@@ -561,6 +567,11 @@ func (s *sysDB) insertWorkflowStatus(ctx context.Context, input insertWorkflowSt
 		queuePartitionKey = &input.status.QueuePartitionKey
 	}
 
+	var parentWorkflowID *string
+	if len(input.status.ParentWorkflowID) > 0 {
+		parentWorkflowID = &input.status.ParentWorkflowID
+	}
+
 	query := fmt.Sprintf(`INSERT INTO %s.workflow_status (
         workflow_uuid,
         status,
@@ -581,17 +592,18 @@ func (s *sysDB) insertWorkflowStatus(ctx context.Context, input insertWorkflowSt
         deduplication_id,
         priority,
         queue_partition_key,
-        owner_xid
-    ) VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
+        owner_xid,
+        parent_workflow_id
+    ) VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)
     ON CONFLICT (workflow_uuid)
         DO UPDATE SET
 			recovery_attempts = CASE
-                WHEN EXCLUDED.status != $21 THEN workflow_status.recovery_attempts + $23
+                WHEN EXCLUDED.status != $22 THEN workflow_status.recovery_attempts + $24
                 ELSE workflow_status.recovery_attempts
             END,
             updated_at = EXCLUDED.updated_at,
             executor_id = CASE
-                WHEN EXCLUDED.status = $22 THEN workflow_status.executor_id
+                WHEN EXCLUDED.status = $23 THEN workflow_status.executor_id
                 ELSE EXCLUDED.executor_id
             END
         RETURNING recovery_attempts, status, name, queue_name, workflow_timeout_ms, workflow_deadline_epoch_ms, owner_xid`, pgx.Identifier{s.schema}.Sanitize())
@@ -633,6 +645,7 @@ func (s *sysDB) insertWorkflowStatus(ctx context.Context, input insertWorkflowSt
 		input.status.Priority,
 		queuePartitionKey,
 		input.ownerXID,
+		parentWorkflowID,
 		WorkflowStatusEnqueued,
 		WorkflowStatusEnqueued,
 		recoveryIncrement,
@@ -707,21 +720,22 @@ func (s *sysDB) insertWorkflowStatus(ctx context.Context, input insertWorkflowSt
 	return &result, nil
 }
 
-// ListWorkflowsInput represents the input parameters for listing workflows
+// listWorkflowsDBInput represents the input parameters for listing workflows.
 type listWorkflowsDBInput struct {
-	workflowName       string
-	queueName          string
+	workflowName       []string
+	queueName          []string
 	queuesOnly         bool
-	workflowIDPrefix   string
+	workflowIDPrefix   []string
 	workflowIDs        []string
-	authenticatedUser  string
+	authenticatedUser  []string
 	startTime          time.Time
 	endTime            time.Time
 	status             []WorkflowStatusType
-	applicationVersion string
+	applicationVersion []string
 	executorIDs        []string
-	forkedFrom         string
-	deduplicationID    string
+	forkedFrom         []string
+	parentWorkflowID   []string
+	deduplicationID    []string
 	limit              *int
 	offset             *int
 	sortDesc           bool
@@ -739,7 +753,7 @@ func (s *sysDB) listWorkflows(ctx context.Context, input listWorkflowsDBInput) (
 		"workflow_uuid", "status", "name", "authenticated_user", "assumed_role", "authenticated_roles",
 		"executor_id", "created_at", "updated_at", "application_version", "application_id",
 		"recovery_attempts", "queue_name", "workflow_timeout_ms", "workflow_deadline_epoch_ms", "started_at_epoch_ms",
-		"deduplication_id", "priority", "queue_partition_key", "forked_from",
+		"deduplication_id", "priority", "queue_partition_key", "forked_from", "parent_workflow_id",
 	}
 
 	if input.loadOutput {
@@ -752,23 +766,23 @@ func (s *sysDB) listWorkflows(ctx context.Context, input listWorkflowsDBInput) (
 	baseQuery := fmt.Sprintf("SELECT %s FROM %s.workflow_status", strings.Join(loadColumns, ", "), pgx.Identifier{s.schema}.Sanitize())
 
 	// Add filters using query builder
-	if input.workflowName != "" {
-		qb.addWhere("name", input.workflowName)
+	if len(input.workflowName) > 0 {
+		qb.addWhereAny("name", input.workflowName)
 	}
-	if input.queueName != "" {
-		qb.addWhere("queue_name", input.queueName)
+	if len(input.queueName) > 0 {
+		qb.addWhereAny("queue_name", input.queueName)
 	}
 	if input.queuesOnly {
 		qb.addWhereIsNotNull("queue_name")
 	}
-	if input.workflowIDPrefix != "" {
-		qb.addWhereLike("workflow_uuid", input.workflowIDPrefix+"%")
+	if len(input.workflowIDPrefix) > 0 {
+		qb.addWhereLikeAny("workflow_uuid", input.workflowIDPrefix, "%")
 	}
 	if len(input.workflowIDs) > 0 {
 		qb.addWhereAny("workflow_uuid", input.workflowIDs)
 	}
-	if input.authenticatedUser != "" {
-		qb.addWhere("authenticated_user", input.authenticatedUser)
+	if len(input.authenticatedUser) > 0 {
+		qb.addWhereAny("authenticated_user", input.authenticatedUser)
 	}
 	if !input.startTime.IsZero() {
 		qb.addWhereGreaterEqual("created_at", input.startTime.UnixMilli())
@@ -779,17 +793,20 @@ func (s *sysDB) listWorkflows(ctx context.Context, input listWorkflowsDBInput) (
 	if len(input.status) > 0 {
 		qb.addWhereAny("status", input.status)
 	}
-	if input.applicationVersion != "" {
-		qb.addWhere("application_version", input.applicationVersion)
+	if len(input.applicationVersion) > 0 {
+		qb.addWhereAny("application_version", input.applicationVersion)
 	}
 	if len(input.executorIDs) > 0 {
 		qb.addWhereAny("executor_id", input.executorIDs)
 	}
-	if input.forkedFrom != "" {
-		qb.addWhere("forked_from", input.forkedFrom)
+	if len(input.forkedFrom) > 0 {
+		qb.addWhereAny("forked_from", input.forkedFrom)
 	}
-	if input.deduplicationID != "" {
-		qb.addWhere("deduplication_id", input.deduplicationID)
+	if len(input.parentWorkflowID) > 0 {
+		qb.addWhereAny("parent_workflow_id", input.parentWorkflowID)
+	}
+	if len(input.deduplicationID) > 0 {
+		qb.addWhereAny("deduplication_id", input.deduplicationID)
 	}
 
 	// Build complete query
@@ -850,6 +867,7 @@ func (s *sysDB) listWorkflows(ctx context.Context, input listWorkflowsDBInput) (
 		var authenticatedRoles *string
 		var queuePartitionKey *string
 		var forkedFrom *string
+		var parentWorkflowID *string
 
 		// Build scan arguments dynamically based on loaded columns
 		scanArgs := []any{
@@ -857,7 +875,7 @@ func (s *sysDB) listWorkflows(ctx context.Context, input listWorkflowsDBInput) (
 			&authenticatedRoles, &executorID, &createdAtMs,
 			&updatedAtMs, &applicationVersion, &wf.ApplicationID,
 			&wf.Attempts, &queueName, &timeoutMs,
-			&deadlineMs, &startedAtMs, &deduplicationID, &wf.Priority, &queuePartitionKey, &forkedFrom,
+			&deadlineMs, &startedAtMs, &deduplicationID, &wf.Priority, &queuePartitionKey, &forkedFrom, &parentWorkflowID,
 		}
 
 		if input.loadOutput {
@@ -900,6 +918,10 @@ func (s *sysDB) listWorkflows(ctx context.Context, input listWorkflowsDBInput) (
 
 		if forkedFrom != nil && len(*forkedFrom) > 0 {
 			wf.ForkedFrom = *forkedFrom
+		}
+
+		if parentWorkflowID != nil && len(*parentWorkflowID) > 0 {
+			wf.ParentWorkflowID = *parentWorkflowID
 		}
 
 		// Convert milliseconds to time.Time
@@ -3022,8 +3044,8 @@ func (s *sysDB) getMetricStepCount(ctx context.Context, startEpochMs, endEpochMs
 /*******************************/
 
 func isCockroachDB(ctx context.Context, conn *pgx.Conn) bool {
-	var dummy int
-	err := conn.QueryRow(ctx, "SELECT 1 FROM crdb_internal.cluster_settings LIMIT 1").Scan(&dummy)
+	var version string
+	err := conn.QueryRow(ctx, "SHOW CLUSTER SETTING version").Scan(&version)
 	return err == nil
 }
 
@@ -3144,6 +3166,20 @@ func (qb *queryBuilder) addWhereAny(column string, values any) {
 	qb.argCounter++
 	qb.whereClauses = append(qb.whereClauses, fmt.Sprintf("%s = ANY($%d)", column, qb.argCounter))
 	qb.args = append(qb.args, values)
+}
+
+// addWhereLikeAny adds (column LIKE $n OR column LIKE $n+1 OR ...) for each prefix+suffix pattern.
+func (qb *queryBuilder) addWhereLikeAny(column string, prefixes []string, suffix string) {
+	if len(prefixes) == 0 {
+		return
+	}
+	ors := make([]string, len(prefixes))
+	for i, p := range prefixes {
+		qb.argCounter++
+		ors[i] = fmt.Sprintf("%s LIKE $%d", column, qb.argCounter)
+		qb.args = append(qb.args, p+suffix)
+	}
+	qb.whereClauses = append(qb.whereClauses, "("+strings.Join(ors, " OR ")+")")
 }
 
 func (qb *queryBuilder) addWhereGreaterEqual(column string, value any) {
