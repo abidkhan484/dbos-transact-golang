@@ -167,6 +167,9 @@ var migration8SQL string
 //go:embed migrations/9_add_workflow_schedules.sql
 var migration9SQL string
 
+//go:embed migrations/10_add_notifications_pkey.sql
+var migration10SQL string
+
 type migrationFile struct {
 	version int64
 	sql     string
@@ -226,6 +229,8 @@ func runMigrations(ctx context.Context, pool *pgxpool.Pool, schema string, isCoc
 
 	migration9SQLProcessed := fmt.Sprintf(migration9SQL, sanitizedSchema)
 
+	migration10SQLProcessed := fmt.Sprintf(migration10SQL, schema, sanitizedSchema)
+
 	// Build migrations list with processed SQL
 	migrations := []migrationFile{
 		{version: 1, sql: migration1SQLProcessed},
@@ -237,6 +242,7 @@ func runMigrations(ctx context.Context, pool *pgxpool.Pool, schema string, isCoc
 		{version: 7, sql: migration7SQLProcessed},
 		{version: 8, sql: migration8SQLProcessed},
 		{version: 9, sql: migration9SQLProcessed},
+		{version: 10, sql: migration10SQLProcessed},
 	}
 
 	// Begin transaction for atomic migration execution
@@ -293,10 +299,37 @@ func runMigrations(ctx context.Context, pool *pgxpool.Pool, schema string, isCoc
 			continue
 		}
 
-		// Execute the migration SQL
-		_, err = tx.Exec(ctx, migration.sql)
-		if err != nil {
-			return fmt.Errorf("failed to execute migration %d: %v", migration.version, err)
+		// Migration 10 uses a DO block with ALTER TABLE, which CockroachDB does not support.
+		// Run the same logic at the application layer.
+		if migration.version == 10 && isCockroach {
+			checkPKQuery := `SELECT 1 FROM pg_constraint c
+		JOIN pg_class cl ON c.conrelid = cl.oid
+		JOIN pg_namespace n ON cl.relnamespace = n.oid
+		WHERE n.nspname = $1
+		  AND cl.relname = 'notifications'
+		  AND c.contype = 'p'`
+			rows, err := tx.Query(ctx, checkPKQuery, schema)
+			if err != nil {
+				return fmt.Errorf("failed to check notifications primary key for migration 10: %v", err)
+			}
+			hasPK := rows.Next()
+			rows.Close()
+			if err := rows.Err(); err != nil {
+				return fmt.Errorf("failed to check notifications primary key for migration 10: %v", err)
+			}
+			if !hasPK {
+				alterQuery := fmt.Sprintf("ALTER TABLE %s.notifications ADD CONSTRAINT notifications_pkey PRIMARY KEY (message_uuid)", pgx.Identifier{schema}.Sanitize())
+				_, err = tx.Exec(ctx, alterQuery)
+				if err != nil {
+					return fmt.Errorf("failed to execute migration 10: %v", err)
+				}
+			}
+		} else {
+			// Execute the migration SQL
+			_, err = tx.Exec(ctx, migration.sql)
+			if err != nil {
+				return fmt.Errorf("failed to execute migration %d: %v", migration.version, err)
+			}
 		}
 
 		// Update the migration version
@@ -1162,7 +1195,7 @@ func (s *sysDB) resumeWorkflow(ctx context.Context, input resumeWorkflowDBInput)
 
 	// Set the workflow's status to ENQUEUED and clear its recovery attempts, set new deadline
 	updateStatusQuery := fmt.Sprintf(`UPDATE %s.workflow_status
-						  SET status = $1, queue_name = $2, recovery_attempts = $3, 
+						  SET status = $1, queue_name = $2, recovery_attempts = $3,
 						      workflow_deadline_epoch_ms = NULL, deduplication_id = NULL,
 						      started_at_epoch_ms = NULL, updated_at = $4
 						  WHERE workflow_uuid = $5`, pgx.Identifier{s.schema}.Sanitize())
@@ -2565,11 +2598,11 @@ func (s *sysDB) writeStream(ctx context.Context, input writeStreamDBInput) error
 		return s.pool.Exec(ctx, sql, args...)
 	}
 
-	checkClosedQuery := fmt.Sprintf(`SELECT 1 FROM %s.streams 
+	checkClosedQuery := fmt.Sprintf(`SELECT 1 FROM %s.streams
 		WHERE workflow_uuid = $1 AND key = $2 AND value = $3 LIMIT 1`,
 		pgx.Identifier{s.schema}.Sanitize())
 
-	getOffsetQuery := fmt.Sprintf(`SELECT COALESCE(MAX("offset"), -1) + 1 FROM %s.streams 
+	getOffsetQuery := fmt.Sprintf(`SELECT COALESCE(MAX("offset"), -1) + 1 FROM %s.streams
 		WHERE workflow_uuid = $1 AND key = $2`,
 		pgx.Identifier{s.schema}.Sanitize())
 
@@ -2604,7 +2637,7 @@ func (s *sysDB) writeStream(ctx context.Context, input writeStreamDBInput) error
 // readStream reads stream entries starting from a given offset.
 // Returns the entries, whether the stream is closed, and any error.
 func (s *sysDB) readStream(ctx context.Context, input readStreamDBInput) ([]streamEntry, bool, error) {
-	query := fmt.Sprintf(`SELECT value, "offset" FROM %s.streams 
+	query := fmt.Sprintf(`SELECT value, "offset" FROM %s.streams
 		WHERE workflow_uuid = $1 AND key = $2 AND "offset" >= $3
 		ORDER BY "offset" ASC`,
 		pgx.Identifier{s.schema}.Sanitize())
