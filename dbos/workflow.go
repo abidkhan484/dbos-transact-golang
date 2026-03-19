@@ -2826,6 +2826,81 @@ func CancelWorkflow(ctx DBOSContext, workflowID string) error {
 	return ctx.CancelWorkflow(ctx, workflowID)
 }
 
+func (c *dbosContext) DeleteWorkflow(_ DBOSContext, workflowID string, opts ...DeleteWorkflowOption) error {
+	// Process options
+	params := &deleteWorkflowOptions{}
+	for _, opt := range opts {
+		opt(params)
+	}
+
+	workflowState, ok := c.Value(workflowStateKey).(*workflowState)
+	isWithinWorkflow := ok && workflowState != nil
+	if isWithinWorkflow {
+		_, err := runAsTxn(c, func(ctx context.Context, tx pgx.Tx) (any, error) {
+			err := c.systemDB.deleteWorkflow(ctx, deleteWorkflowDBInput{
+				workflowID:     workflowID,
+				deleteChildren: params.deleteChildren,
+				tx:             tx,
+			})
+			return "", err
+		}, WithStepName("DBOS.deleteWorkflow"))
+		return err
+	} else {
+		return retry(c, func() error {
+			return c.systemDB.deleteWorkflow(c, deleteWorkflowDBInput{
+				workflowID:     workflowID,
+				deleteChildren: params.deleteChildren,
+			})
+		}, withRetrierLogger(c.logger))
+	}
+}
+
+// deleteWorkflowOptions holds configuration parameters for deleting workflows.
+type deleteWorkflowOptions struct {
+	deleteChildren bool
+}
+
+// DeleteWorkflowOption is a functional option for configuring workflow deletion.
+type DeleteWorkflowOption func(*deleteWorkflowOptions)
+
+// WithDeleteChildren enables recursive deletion of child workflows.
+// When set, all child workflows (and their children, recursively) will be deleted
+// along with the parent workflow.
+func WithDeleteChildren() DeleteWorkflowOption {
+	return func(o *deleteWorkflowOptions) {
+		o.deleteChildren = true
+	}
+}
+
+// DeleteWorkflow permanently deletes a workflow and all its associated data from the database,
+// regardless of its current status. This includes active (PENDING, ENQUEUED) workflows.
+//
+// This operation is irreversible and removes the workflow status, operation outputs,
+// events, event history, and streams associated with the workflow.
+//
+// Options:
+//   - WithDeleteChildren: Also delete all child workflows recursively
+//
+// Parameters:
+//   - ctx: DBOS context for the operation
+//   - workflowID: The unique identifier of the workflow to delete
+//
+// Returns an error if the workflow does not exist, is still active, or if the deletion fails.
+//
+// Example:
+//
+//	// Delete a single workflow
+//	err := dbos.DeleteWorkflow(ctx, "workflow-to-delete")
+//
+//	// Delete a workflow and all its children
+//	err := dbos.DeleteWorkflow(ctx, "workflow-to-delete", dbos.WithDeleteChildren())
+func DeleteWorkflow(ctx DBOSContext, workflowID string, opts ...DeleteWorkflowOption) error {
+	if ctx == nil {
+		return errors.New("ctx cannot be nil")
+	}
+	return ctx.DeleteWorkflow(ctx, workflowID, opts...)
+}
+
 func (c *dbosContext) ResumeWorkflow(_ DBOSContext, workflowID string) (WorkflowHandle[any], error) {
 	workflowState, ok := c.Value(workflowStateKey).(*workflowState)
 	isWithinWorkflow := ok && workflowState != nil
