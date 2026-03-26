@@ -13,10 +13,11 @@ import (
 )
 
 type ClientConfig struct {
-	DatabaseURL    string        // DatabaseURL is a PostgreSQL connection string. Either this or SystemDBPool is required.
-	SystemDBPool   *pgxpool.Pool // SystemDBPool is a custom System Database Pool. It's optional and takes precedence over DatabaseURL if both are provided.
-	DatabaseSchema string        // Database schema name (defaults to "dbos")
-	Logger         *slog.Logger  // Optional custom logger
+	DatabaseURL    string          // DatabaseURL is a PostgreSQL connection string. Either this or SystemDBPool is required.
+	SystemDBPool   *pgxpool.Pool   // SystemDBPool is a custom System Database Pool. It's optional and takes precedence over DatabaseURL if both are provided.
+	DatabaseSchema string          // Database schema name (defaults to "dbos")
+	Logger         *slog.Logger    // Optional custom logger
+	Serializer     Serializer[any] // Optional custom serializer (defaults to JSON)
 }
 
 // Client provides a programmatic way to interact with your DBOS application from external code.
@@ -61,6 +62,7 @@ func NewClient(ctx context.Context, config ClientConfig) (Client, error) {
 		AppName:        "dbos-client",
 		Logger:         config.Logger,
 		SystemDBPool:   config.SystemDBPool,
+		Serializer:     config.Serializer,
 	})
 	if err != nil {
 		return nil, err
@@ -275,8 +277,7 @@ func Enqueue[P any, R any](c Client, queueName, workflowName string, input P, op
 	}
 
 	// Serialize input
-	serializer := newJSONSerializer[P]()
-	encodedInput, err := serializer.Encode(input)
+	encodedInput, err := encodeValue(c.(*client).dbosCtx.(*dbosContext).serializer, input)
 	if err != nil {
 		return nil, fmt.Errorf("failed to serialize workflow input: %w", err)
 	}
@@ -370,14 +371,14 @@ func ClientReadStream[R any](c Client, workflowID string, key string) ([]R, bool
 	}
 
 	// Decode each value to type R
-	serializer := newJSONSerializer[R]()
+	customSer := c.(*client).dbosCtx.(*dbosContext).serializer
 	typedValues := make([]R, len(values))
 	for i, val := range values {
 		encodedStr, ok := val.(string)
 		if !ok {
 			return nil, false, fmt.Errorf("stream value is not a string, got %T", val)
 		}
-		decodedValue, decodeErr := serializer.Decode(&encodedStr)
+		decodedValue, decodeErr := decodeValue[R](customSer, &encodedStr)
 		if decodeErr != nil {
 			return nil, false, fmt.Errorf("decoding stream value to type %T: %w", *new(R), decodeErr)
 		}
@@ -432,7 +433,7 @@ func ClientReadStreamAsync[R any](c Client, workflowID string, key string) (<-ch
 	go func() {
 		defer close(typedCh)
 
-		serializer := newJSONSerializer[R]()
+		customSer := c.(*client).dbosCtx.(*dbosContext).serializer
 
 		for streamValue := range anyCh {
 			if streamValue.Err != nil {
@@ -451,7 +452,7 @@ func ClientReadStreamAsync[R any](c Client, workflowID string, key string) (<-ch
 				return
 			}
 
-			decodedValue, decodeErr := serializer.Decode(&encodedStr)
+			decodedValue, decodeErr := decodeValue[R](customSer, &encodedStr)
 			if decodeErr != nil {
 				typedCh <- StreamValue[R]{Err: fmt.Errorf("decoding stream value to type %T: %w", *new(R), decodeErr)}
 				return
