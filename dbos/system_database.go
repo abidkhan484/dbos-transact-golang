@@ -38,7 +38,7 @@ type systemDatabase interface {
 	insertWorkflowStatus(ctx context.Context, input insertWorkflowStatusDBInput) (*insertWorkflowResult, error)
 	listWorkflows(ctx context.Context, input listWorkflowsDBInput) ([]WorkflowStatus, error)
 	updateWorkflowOutcome(ctx context.Context, input updateWorkflowOutcomeDBInput) error
-	awaitWorkflowResult(ctx context.Context, workflowID string, pollInterval time.Duration) (*string, error)
+	awaitWorkflowResult(ctx context.Context, workflowID string, pollInterval time.Duration) (*awaitWorkflowResultOutput, error)
 	cancelWorkflow(ctx context.Context, input cancelWorkflowDBInput) error
 	cancelAllBefore(ctx context.Context, cutoffTime time.Time) error
 	deleteWorkflows(ctx context.Context, input deleteWorkflowsDBInput) error
@@ -57,9 +57,9 @@ type systemDatabase interface {
 
 	// Communication (special steps)
 	send(ctx context.Context, input WorkflowSendInput) error
-	recv(ctx context.Context, input recvInput) (*string, error)
+	recv(ctx context.Context, input recvInput) (*recvResult, error)
 	setEvent(ctx context.Context, input WorkflowSetEventInput) error
-	getEvent(ctx context.Context, input getEventInput) (*string, error)
+	getEvent(ctx context.Context, input getEventInput) (*getEventResult, error)
 
 	// Streams
 	writeStream(ctx context.Context, input writeStreamDBInput) error
@@ -194,6 +194,9 @@ var migration12SQL string
 //go:embed migrations/13_add_application_versions.sql
 var migration13SQL string
 
+//go:embed migrations/14_add_pgsql_client_functions.sql
+var migration14SQL string
+
 type migrationFile struct {
 	version int64
 	sql     string
@@ -261,6 +264,8 @@ func runMigrations(ctx context.Context, pool *pgxpool.Pool, schema string, isCoc
 
 	migration13SQLProcessed := fmt.Sprintf(migration13SQL, sanitizedSchema)
 
+	migration14SQLProcessed := fmt.Sprintf(migration14SQL, sanitizedSchema, sanitizedSchema, sanitizedSchema, sanitizedSchema)
+
 	// Build migrations list with processed SQL
 	migrations := []migrationFile{
 		{version: 1, sql: migration1SQLProcessed},
@@ -276,6 +281,7 @@ func runMigrations(ctx context.Context, pool *pgxpool.Pool, schema string, isCoc
 		{version: 11, sql: migration11SQLProcessed},
 		{version: 12, sql: migration12SQLProcessed},
 		{version: 13, sql: migration13SQLProcessed},
+		{version: 14, sql: migration14SQLProcessed},
 	}
 
 	// Begin transaction for atomic migration execution
@@ -644,6 +650,11 @@ func (s *sysDB) insertWorkflowStatus(ctx context.Context, input insertWorkflowSt
 		parentWorkflowID = &input.status.ParentWorkflowID
 	}
 
+	var className *string
+	if len(input.status.ClassName) > 0 {
+		className = &input.status.ClassName
+	}
+
 	query := fmt.Sprintf(`INSERT INTO %s.workflow_status (
         workflow_uuid,
         status,
@@ -665,17 +676,20 @@ func (s *sysDB) insertWorkflowStatus(ctx context.Context, input insertWorkflowSt
         priority,
         queue_partition_key,
         owner_xid,
-        parent_workflow_id
-    ) VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)
+        parent_workflow_id,
+        class_name,
+        config_name,
+        serialization
+    ) VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24)
     ON CONFLICT (workflow_uuid)
         DO UPDATE SET
 			recovery_attempts = CASE
-                WHEN EXCLUDED.status != $22 THEN workflow_status.recovery_attempts + $24
+                WHEN EXCLUDED.status != $25 THEN workflow_status.recovery_attempts + $27
                 ELSE workflow_status.recovery_attempts
             END,
             updated_at = EXCLUDED.updated_at,
             executor_id = CASE
-                WHEN EXCLUDED.status = $23 THEN workflow_status.executor_id
+                WHEN EXCLUDED.status = $26 THEN workflow_status.executor_id
                 ELSE EXCLUDED.executor_id
             END
         RETURNING recovery_attempts, status, name, queue_name, workflow_timeout_ms, workflow_deadline_epoch_ms, owner_xid`, pgx.Identifier{s.schema}.Sanitize())
@@ -712,12 +726,15 @@ func (s *sysDB) insertWorkflowStatus(ctx context.Context, input insertWorkflowSt
 		updatedAt.UnixMilli(),
 		timeoutMs,
 		deadline,
-		input.status.Input, // encoded input (already *string)
+		input.status.Input,
 		deduplicationID,
 		input.status.Priority,
 		queuePartitionKey,
 		input.ownerXID,
 		parentWorkflowID,
+		className,
+		input.status.ConfigName,
+		input.status.Serialization,
 		WorkflowStatusEnqueued,
 		WorkflowStatusEnqueued,
 		recoveryIncrement,
@@ -826,6 +843,7 @@ func (s *sysDB) listWorkflows(ctx context.Context, input listWorkflowsDBInput) (
 		"executor_id", "created_at", "updated_at", "application_version", "application_id",
 		"recovery_attempts", "queue_name", "workflow_timeout_ms", "workflow_deadline_epoch_ms", "started_at_epoch_ms",
 		"deduplication_id", "priority", "queue_partition_key", "forked_from", "parent_workflow_id",
+		"serialization",
 	}
 
 	if input.loadOutput {
@@ -940,14 +958,19 @@ func (s *sysDB) listWorkflows(ctx context.Context, input listWorkflowsDBInput) (
 		var queuePartitionKey *string
 		var forkedFrom *string
 		var parentWorkflowID *string
+		var serialization *string
+		var authenticatedUser *string
+		var assumedRole *string
+		var applicationID *string
 
-		// Build scan arguments dynamically based on loaded columns
+		// Build scan arguments dynamically based on loaded columns.
 		scanArgs := []any{
-			&wf.ID, &wf.Status, &wf.Name, &wf.AuthenticatedUser, &wf.AssumedRole,
+			&wf.ID, &wf.Status, &wf.Name, &authenticatedUser, &assumedRole,
 			&authenticatedRoles, &executorID, &createdAtMs,
-			&updatedAtMs, &applicationVersion, &wf.ApplicationID,
+			&updatedAtMs, &applicationVersion, &applicationID,
 			&wf.Attempts, &queueName, &timeoutMs,
 			&deadlineMs, &startedAtMs, &deduplicationID, &wf.Priority, &queuePartitionKey, &forkedFrom, &parentWorkflowID,
+			&serialization,
 		}
 
 		if input.loadOutput {
@@ -960,6 +983,16 @@ func (s *sysDB) listWorkflows(ctx context.Context, input listWorkflowsDBInput) (
 		err := rows.Scan(scanArgs...)
 		if err != nil {
 			return nil, fmt.Errorf("failed to scan workflow row: %w", err)
+		}
+
+		if authenticatedUser != nil {
+			wf.AuthenticatedUser = *authenticatedUser
+		}
+		if assumedRole != nil {
+			wf.AssumedRole = *assumedRole
+		}
+		if applicationID != nil {
+			wf.ApplicationID = *applicationID
 		}
 
 		if authenticatedRoles != nil && *authenticatedRoles != "" {
@@ -994,6 +1027,10 @@ func (s *sysDB) listWorkflows(ctx context.Context, input listWorkflowsDBInput) (
 
 		if parentWorkflowID != nil && len(*parentWorkflowID) > 0 {
 			wf.ParentWorkflowID = *parentWorkflowID
+		}
+
+		if serialization != nil && len(*serialization) > 0 {
+			wf.Serialization = *serialization
 		}
 
 		// Convert milliseconds to time.Time
@@ -1045,7 +1082,7 @@ type updateWorkflowOutcomeDBInput struct {
 	workflowID string
 	status     WorkflowStatusType
 	output     *string
-	err        error
+	errStr     string
 	tx         pgx.Tx
 }
 
@@ -1056,17 +1093,12 @@ func (s *sysDB) updateWorkflowOutcome(ctx context.Context, input updateWorkflowO
 			  SET status = $1, output = $2, error = $3, updated_at = $4, deduplication_id = NULL
 			  WHERE workflow_uuid = $5 AND NOT (status = $6 AND $1::TEXT IN ($7, $8))`, pgx.Identifier{s.schema}.Sanitize())
 
-	var errorStr string
-	if input.err != nil {
-		errorStr = input.err.Error()
-	}
-
 	// input.output is already a *string from the database layer
 	var err error
 	if input.tx != nil {
-		_, err = input.tx.Exec(ctx, query, input.status, input.output, errorStr, time.Now().UnixMilli(), input.workflowID, WorkflowStatusCancelled, WorkflowStatusSuccess, WorkflowStatusError)
+		_, err = input.tx.Exec(ctx, query, input.status, input.output, input.errStr, time.Now().UnixMilli(), input.workflowID, WorkflowStatusCancelled, WorkflowStatusSuccess, WorkflowStatusError)
 	} else {
-		_, err = s.pool.Exec(ctx, query, input.status, input.output, errorStr, time.Now().UnixMilli(), input.workflowID, WorkflowStatusCancelled, WorkflowStatusSuccess, WorkflowStatusError)
+		_, err = s.pool.Exec(ctx, query, input.status, input.output, input.errStr, time.Now().UnixMilli(), input.workflowID, WorkflowStatusCancelled, WorkflowStatusSuccess, WorkflowStatusError)
 	}
 
 	if err != nil {
@@ -1502,8 +1534,14 @@ func (s *sysDB) forkWorkflow(ctx context.Context, input forkWorkflowDBInput) (st
 	return forkedWorkflowID, nil
 }
 
-func (s *sysDB) awaitWorkflowResult(ctx context.Context, workflowID string, pollInterval time.Duration) (*string, error) {
-	query := fmt.Sprintf(`SELECT status, output, error, recovery_attempts FROM %s.workflow_status WHERE workflow_uuid = $1`, pgx.Identifier{s.schema}.Sanitize())
+type awaitWorkflowResultOutput struct {
+	output        *string
+	serialization string
+	errStr        *string
+}
+
+func (s *sysDB) awaitWorkflowResult(ctx context.Context, workflowID string, pollInterval time.Duration) (*awaitWorkflowResultOutput, error) {
+	query := fmt.Sprintf(`SELECT status, output, error, recovery_attempts, serialization FROM %s.workflow_status WHERE workflow_uuid = $1`, pgx.Identifier{s.schema}.Sanitize())
 	var status WorkflowStatusType
 	if pollInterval <= 0 {
 		pollInterval = _DB_RETRY_INTERVAL
@@ -1519,7 +1557,8 @@ func (s *sysDB) awaitWorkflowResult(ctx context.Context, workflowID string, poll
 		var outputString *string
 		var errorStr *string
 		var attempts int
-		err := row.Scan(&status, &outputString, &errorStr, &attempts)
+		var serialization *string
+		err := row.Scan(&status, &outputString, &errorStr, &attempts, &serialization)
 		if err != nil {
 			if err == pgx.ErrNoRows {
 				time.Sleep(pollInterval)
@@ -1528,16 +1567,22 @@ func (s *sysDB) awaitWorkflowResult(ctx context.Context, workflowID string, poll
 			return nil, fmt.Errorf("failed to query workflow status: %w", err)
 		}
 
+		var storedSerialization string
+		if serialization != nil {
+			storedSerialization = *serialization
+		}
+		result := &awaitWorkflowResultOutput{output: outputString, serialization: storedSerialization}
+
 		switch status {
 		case WorkflowStatusSuccess, WorkflowStatusError:
-			if errorStr == nil || len(*errorStr) == 0 {
-				return outputString, nil
+			if errorStr != nil && len(*errorStr) > 0 {
+				result.errStr = errorStr
 			}
-			return outputString, errors.New(*errorStr)
+			return result, nil
 		case WorkflowStatusCancelled:
-			return outputString, newAwaitedWorkflowCancelledError(workflowID)
+			return result, newAwaitedWorkflowCancelledError(workflowID)
 		case WorkflowStatusMaxRecoveryAttemptsExceeded:
-			return outputString, newDeadLetterQueueError(workflowID, attempts-2)
+			return result, newDeadLetterQueueError(workflowID, attempts-2)
 		default:
 			time.Sleep(pollInterval)
 		}
@@ -1550,26 +1595,21 @@ type recordOperationResultDBInput struct {
 	stepID          int
 	stepName        string
 	output          *string
-	err             error
+	errStr          *string
 	tx              pgx.Tx
 	startedAt       time.Time
 	completedAt     time.Time
+	serialization   string
 }
 
 func (s *sysDB) recordOperationResult(ctx context.Context, input recordOperationResultDBInput) error {
 	startedAtMs := input.startedAt.UnixMilli()
 	completedAtMs := input.completedAt.UnixMilli()
 
-	var errorString *string
-	if input.err != nil {
-		e := input.err.Error()
-		errorString = &e
-	}
-
-	columns := []string{"workflow_uuid", "function_id", "output", "error", "function_name", "started_at_epoch_ms", "completed_at_epoch_ms"}
-	placeholders := []string{"$1", "$2", "$3", "$4", "$5", "$6", "$7"}
-	args := []any{input.workflowID, input.stepID, input.output, errorString, input.stepName, startedAtMs, completedAtMs}
-	argCounter := 7
+	columns := []string{"workflow_uuid", "function_id", "output", "error", "function_name", "started_at_epoch_ms", "completed_at_epoch_ms", "serialization"}
+	placeholders := []string{"$1", "$2", "$3", "$4", "$5", "$6", "$7", "$8"}
+	args := []any{input.workflowID, input.stepID, input.output, input.errStr, input.stepName, startedAtMs, completedAtMs, input.serialization}
+	argCounter := 8
 
 	if input.childWorkflowID != "" {
 		columns = append(columns, "child_workflow_id")
@@ -1673,8 +1713,9 @@ func (s *sysDB) checkChildWorkflow(ctx context.Context, workflowID string, funct
 /*******************************/
 
 type recordedResult struct {
-	output *string
-	err    error
+	output        *string
+	errStr        *string
+	serialization string
 }
 
 type checkOperationExecutionDBInput struct {
@@ -1703,7 +1744,7 @@ func (s *sysDB) checkOperationExecution(ctx context.Context, input checkOperatio
 	workflowStatusQuery := fmt.Sprintf(`SELECT status FROM %s.workflow_status WHERE workflow_uuid = $1`, pgx.Identifier{s.schema}.Sanitize())
 
 	// Second query: Retrieve operation outputs if they exist
-	stepOutputQuery := fmt.Sprintf(`SELECT output, error, function_name
+	stepOutputQuery := fmt.Sprintf(`SELECT output, error, function_name, serialization
 							 FROM %s.operation_outputs
 							 WHERE workflow_uuid = $1 AND function_id = $2`, pgx.Identifier{s.schema}.Sanitize())
 
@@ -1727,8 +1768,9 @@ func (s *sysDB) checkOperationExecution(ctx context.Context, input checkOperatio
 	var outputString *string
 	var errorStr *string
 	var recordedFunctionName string
+	var serialization *string
 
-	err = tx.QueryRow(ctx, stepOutputQuery, input.workflowID, input.stepID).Scan(&outputString, &errorStr, &recordedFunctionName)
+	err = tx.QueryRow(ctx, stepOutputQuery, input.workflowID, input.stepID).Scan(&outputString, &errorStr, &recordedFunctionName, &serialization)
 
 	// If there are no operation outputs, return nil
 	if err != nil {
@@ -1743,13 +1785,18 @@ func (s *sysDB) checkOperationExecution(ctx context.Context, input checkOperatio
 		return nil, newUnexpectedStepError(input.workflowID, input.stepID, input.stepName, recordedFunctionName)
 	}
 
-	var recordedError error
+	var storedSerialization string
+	if serialization != nil {
+		storedSerialization = *serialization
+	}
+	var recordedErrStr *string
 	if errorStr != nil && *errorStr != "" {
-		recordedError = errors.New(*errorStr)
+		recordedErrStr = errorStr
 	}
 	result := &recordedResult{
-		output: outputString,
-		err:    recordedError,
+		output:        outputString,
+		errStr:        recordedErrStr,
+		serialization: storedSerialization,
 	}
 	return result, nil
 }
@@ -1763,6 +1810,7 @@ type stepInfo struct {
 	ChildWorkflowID string    // The ID of a child workflow spawned by this step (if applicable)
 	StartedAt       time.Time // When the step execution started
 	CompletedAt     time.Time // When the step execution completed
+	Serialization   string    // The serialization format used for this step
 }
 
 type getWorkflowStepsInput struct {
@@ -1771,7 +1819,7 @@ type getWorkflowStepsInput struct {
 }
 
 func (s *sysDB) getWorkflowSteps(ctx context.Context, input getWorkflowStepsInput) ([]stepInfo, error) {
-	query := fmt.Sprintf(`SELECT function_id, function_name, output, error, child_workflow_id, started_at_epoch_ms, completed_at_epoch_ms
+	query := fmt.Sprintf(`SELECT function_id, function_name, output, error, child_workflow_id, started_at_epoch_ms, completed_at_epoch_ms, serialization
 			  FROM %s.operation_outputs
 			  WHERE workflow_uuid = $1
 			  ORDER BY function_id ASC`, pgx.Identifier{s.schema}.Sanitize())
@@ -1789,8 +1837,9 @@ func (s *sysDB) getWorkflowSteps(ctx context.Context, input getWorkflowStepsInpu
 		var errorString *string
 		var childWorkflowID *string
 		var startedAtMs, completedAtMs *int64
+		var serialization *string
 
-		err := rows.Scan(&step.StepID, &step.StepName, &outputString, &errorString, &childWorkflowID, &startedAtMs, &completedAtMs)
+		err := rows.Scan(&step.StepID, &step.StepName, &outputString, &errorString, &childWorkflowID, &startedAtMs, &completedAtMs, &serialization)
 		if err != nil {
 			return nil, fmt.Errorf("failed to scan step row: %w", err)
 		}
@@ -1808,6 +1857,11 @@ func (s *sysDB) getWorkflowSteps(ctx context.Context, input getWorkflowStepsInpu
 			step.Output = outputString
 		}
 
+		var storedSerialization string
+		if serialization != nil {
+			storedSerialization = *serialization
+		}
+		step.Serialization = storedSerialization
 		// Convert error string to error if present
 		if errorString != nil && *errorString != "" {
 			step.Error = errors.New(*errorString)
@@ -1884,8 +1938,8 @@ func (s *sysDB) sleep(ctx context.Context, input sleepInput) (time.Duration, err
 			return 0, fmt.Errorf("failed to decode sleep end time: %w", err)
 		}
 
-		if recordedResult.err != nil { // This should never happen
-			return 0, recordedResult.err
+		if recordedResult.errStr != nil { // This should never happen
+			return 0, errors.New(*recordedResult.errStr)
 		}
 	} else {
 		// First execution: calculate and record the end time
@@ -1901,13 +1955,13 @@ func (s *sysDB) sleep(ctx context.Context, input sleepInput) (time.Duration, err
 		// Record the operation result with the calculated end time
 		completedTime := time.Now()
 		recordInput := recordOperationResultDBInput{
-			workflowID:  wfState.workflowID,
-			stepID:      stepID,
-			stepName:    functionName,
-			output:      encodedEndTime,
-			err:         nil,
-			startedAt:   startTime,
-			completedAt: completedTime,
+			workflowID:    wfState.workflowID,
+			stepID:        stepID,
+			stepName:      functionName,
+			output:        encodedEndTime,
+			startedAt:     startTime,
+			completedAt:   completedTime,
+			serialization: "DBOS_JSON",
 		}
 
 		err = s.recordOperationResult(ctx, recordInput)
@@ -2209,6 +2263,7 @@ type WorkflowSendInput struct {
 	Message       any
 	Topic         string
 	tx            pgx.Tx
+	serialization string
 }
 
 // Send is a special type of step that sends a message to another workflow.
@@ -2225,12 +2280,12 @@ func (s *sysDB) send(ctx context.Context, input WorkflowSendInput) error {
 		topic = input.Topic
 	}
 
-	insertQuery := fmt.Sprintf(`INSERT INTO %s.notifications (destination_uuid, topic, message) VALUES ($1, $2, $3)`, pgx.Identifier{s.schema}.Sanitize())
+	insertQuery := fmt.Sprintf(`INSERT INTO %s.notifications (destination_uuid, topic, message, serialization) VALUES ($1, $2, $3, $4)`, pgx.Identifier{s.schema}.Sanitize())
 	var err error
 	if input.tx != nil {
-		_, err = input.tx.Exec(ctx, insertQuery, input.DestinationID, topic, input.Message)
+		_, err = input.tx.Exec(ctx, insertQuery, input.DestinationID, topic, input.Message, input.serialization)
 	} else {
-		_, err = s.pool.Exec(ctx, insertQuery, input.DestinationID, topic, input.Message)
+		_, err = s.pool.Exec(ctx, insertQuery, input.DestinationID, topic, input.Message, input.serialization)
 	}
 	if err != nil {
 		s.logger.Error("failed to insert notification", "error", err, "query", insertQuery, "destination_id", input.DestinationID, "topic", topic, "message", input.Message)
@@ -2244,7 +2299,7 @@ func (s *sysDB) send(ctx context.Context, input WorkflowSendInput) error {
 }
 
 // Recv is a special type of step that receives a message destined for a given workflow
-func (s *sysDB) recv(ctx context.Context, input recvInput) (*string, error) {
+func (s *sysDB) recv(ctx context.Context, input recvInput) (*recvResult, error) {
 	functionName := "DBOS.recv"
 
 	// Get workflow state from context
@@ -2274,7 +2329,11 @@ func (s *sysDB) recv(ctx context.Context, input recvInput) (*string, error) {
 		return nil, err
 	}
 	if recordedResult != nil {
-		return recordedResult.output, recordedResult.err
+		var recvErr error
+		if recordedResult.errStr != nil {
+			recvErr = errors.New(*recordedResult.errStr)
+		}
+		return &recvResult{message: recordedResult.output, serialization: recordedResult.serialization}, recvErr
 	}
 
 	// First check if there's already a receiver for this workflow/topic to avoid unnecessary database load
@@ -2366,7 +2425,7 @@ loop:
 	// Use message_uuid so we delete exactly one row; created_at_epoch_ms can match multiple rows when inserts occur in the same millisecond.
 	query = fmt.Sprintf(`
     WITH oldest_entry AS (
-        SELECT message_uuid, message
+        SELECT message_uuid, message, serialization
         FROM %s.notifications
         WHERE destination_uuid = $1 AND topic = $2
         ORDER BY created_at_epoch_ms ASC
@@ -2374,31 +2433,42 @@ loop:
     )
     DELETE FROM %s.notifications
     WHERE message_uuid = (SELECT message_uuid FROM oldest_entry)
-    RETURNING message`, pgx.Identifier{s.schema}.Sanitize(), pgx.Identifier{s.schema}.Sanitize())
+    RETURNING message, serialization`, pgx.Identifier{s.schema}.Sanitize(), pgx.Identifier{s.schema}.Sanitize())
 
 	var messageString *string
-	err = tx.QueryRow(ctx, query, destinationID, topic).Scan(&messageString)
+	var msgSerialization *string
+	err = tx.QueryRow(ctx, query, destinationID, topic).Scan(&messageString, &msgSerialization)
 	if err != nil {
 		if err != pgx.ErrNoRows {
 			return nil, fmt.Errorf("failed to consume message: %w", err)
 		}
 	}
 
+	// Use the sender's serialization from the notification; fall back to receiver's format for timeout/no-message case
+	serialization := input.serialization
+	if msgSerialization != nil && len(*msgSerialization) > 0 {
+		serialization = *msgSerialization
+	}
+
 	// Record the operation result (with encoded message string)
 	completedTime := time.Now()
 	recordInput := recordOperationResultDBInput{
-		workflowID:  destinationID,
-		stepID:      stepID,
-		stepName:    functionName,
-		output:      messageString,
-		tx:          tx,
-		startedAt:   startTime,
-		completedAt: completedTime,
+		workflowID:    destinationID,
+		stepID:        stepID,
+		stepName:      functionName,
+		output:        messageString,
+		tx:            tx,
+		startedAt:     startTime,
+		completedAt:   completedTime,
+		serialization: serialization,
 	}
 
 	// Record an error if no message found and timeout occurred
+	var timeoutErr error
 	if timeoutOccurred && messageString == nil {
-		recordInput.err = newTimeoutError(destinationID, functionName, fmt.Sprintf("no message received within %v", input.Timeout))
+		timeoutErr = newTimeoutError(destinationID, functionName, fmt.Sprintf("no message received within %v", input.Timeout))
+		s := timeoutErr.Error()
+		recordInput.errStr = &s
 	}
 
 	err = s.recordOperationResult(ctx, recordInput)
@@ -2410,14 +2480,15 @@ loop:
 		return nil, fmt.Errorf("failed to commit transaction: %w", err)
 	}
 
-	// Return the message string pointer and the timeout error if any
-	return messageString, recordInput.err
+	// Return the message and its serialization format
+	return &recvResult{message: messageString, serialization: serialization}, timeoutErr
 }
 
 type WorkflowSetEventInput struct {
-	Key     string
-	Message any
-	tx      pgx.Tx
+	Key           string
+	Message       any
+	tx            pgx.Tx
+	serialization string
 }
 
 func (s *sysDB) setEvent(ctx context.Context, input WorkflowSetEventInput) error {
@@ -2433,36 +2504,36 @@ func (s *sysDB) setEvent(ctx context.Context, input WorkflowSetEventInput) error
 
 	// input.Message is already encoded *string from the typed layer
 	// Insert or update the event using UPSERT
-	insertQuery := fmt.Sprintf(`INSERT INTO %s.workflow_events (workflow_uuid, key, value)
-					VALUES ($1, $2, $3)
+	insertQuery := fmt.Sprintf(`INSERT INTO %s.workflow_events (workflow_uuid, key, value, serialization)
+					VALUES ($1, $2, $3, $4)
 					ON CONFLICT (workflow_uuid, key)
-					DO UPDATE SET value = EXCLUDED.value`, pgx.Identifier{s.schema}.Sanitize())
+					DO UPDATE SET value = EXCLUDED.value, serialization = EXCLUDED.serialization`, pgx.Identifier{s.schema}.Sanitize())
 
 	var err error
 	if input.tx != nil {
-		_, err = input.tx.Exec(ctx, insertQuery, wfState.workflowID, input.Key, input.Message)
+		_, err = input.tx.Exec(ctx, insertQuery, wfState.workflowID, input.Key, input.Message, input.serialization)
 	} else {
-		_, err = s.pool.Exec(ctx, insertQuery, wfState.workflowID, input.Key, input.Message)
+		_, err = s.pool.Exec(ctx, insertQuery, wfState.workflowID, input.Key, input.Message, input.serialization)
 	}
 	if err != nil {
 		return fmt.Errorf("failed to insert event: %w", err)
 	}
 
 	// Record event in workflow_events_history
-	insertHistoryQuery := fmt.Sprintf(`INSERT INTO %s.workflow_events_history (workflow_uuid, function_id, key, value)
-					VALUES ($1, $2, $3, $4)
+	insertHistoryQuery := fmt.Sprintf(`INSERT INTO %s.workflow_events_history (workflow_uuid, function_id, key, value, serialization)
+					VALUES ($1, $2, $3, $4, $5)
 					ON CONFLICT (workflow_uuid, function_id, key)
-					DO UPDATE SET value = EXCLUDED.value`, pgx.Identifier{s.schema}.Sanitize())
+					DO UPDATE SET value = EXCLUDED.value, serialization = EXCLUDED.serialization`, pgx.Identifier{s.schema}.Sanitize())
 
 	if input.tx != nil {
-		_, err = input.tx.Exec(ctx, insertHistoryQuery, wfState.workflowID, wfState.stepID, input.Key, input.Message)
+		_, err = input.tx.Exec(ctx, insertHistoryQuery, wfState.workflowID, wfState.stepID, input.Key, input.Message, input.serialization)
 	} else {
-		_, err = s.pool.Exec(ctx, insertHistoryQuery, wfState.workflowID, wfState.stepID, input.Key, input.Message)
+		_, err = s.pool.Exec(ctx, insertHistoryQuery, wfState.workflowID, wfState.stepID, input.Key, input.Message, input.serialization)
 	}
 	return err
 }
 
-func (s *sysDB) getEvent(ctx context.Context, input getEventInput) (*string, error) {
+func (s *sysDB) getEvent(ctx context.Context, input getEventInput) (*getEventResult, error) {
 	functionName := "DBOS.getEvent"
 
 	// Get workflow state from context (optional for GetEvent as we can get an event from outside a workflow)
@@ -2491,7 +2562,11 @@ func (s *sysDB) getEvent(ctx context.Context, input getEventInput) (*string, err
 			return nil, err
 		}
 		if recordedResult != nil {
-			return recordedResult.output, recordedResult.err
+			var evtErr error
+			if recordedResult.errStr != nil {
+				evtErr = errors.New(*recordedResult.errStr)
+			}
+			return &getEventResult{value: recordedResult.output, serialization: recordedResult.serialization}, evtErr
 		}
 	}
 
@@ -2517,15 +2592,16 @@ func (s *sysDB) getEvent(ctx context.Context, input getEventInput) (*string, err
 	}()
 
 	// Check if the event already exists in the database
-	query := fmt.Sprintf(`SELECT value FROM %s.workflow_events WHERE workflow_uuid = $1 AND key = $2`, pgx.Identifier{s.schema}.Sanitize())
+	query := fmt.Sprintf(`SELECT value, serialization FROM %s.workflow_events WHERE workflow_uuid = $1 AND key = $2`, pgx.Identifier{s.schema}.Sanitize())
 	var valueString *string
+	var evtSerialization *string
 	var row pgx.Row
 	var err error
 
 	// Helper function to query the event and handle errors
 	queryEvent := func() error {
 		row = s.pool.QueryRow(ctx, query, input.TargetWorkflowID, input.Key)
-		err = row.Scan(&valueString)
+		err = row.Scan(&valueString, &evtSerialization)
 		if err != nil && err != pgx.ErrNoRows {
 			if !loaded {
 				cond.L.Unlock()
@@ -2604,24 +2680,31 @@ func (s *sysDB) getEvent(ctx context.Context, input getEventInput) (*string, err
 		}
 	}
 
+	// Use the event's serialization from the DB; fall back to caller's format for timeout/no-event case
+	serialization := input.serialization
+	if evtSerialization != nil && len(*evtSerialization) > 0 {
+		serialization = *evtSerialization
+	}
+
 	// Record the operation result if this is called within a workflow
 	var timeoutErr error
 	if isInWorkflow {
 		completedTime := time.Now()
 		recordInput := recordOperationResultDBInput{
-			workflowID:  wfState.workflowID,
-			stepID:      stepID,
-			stepName:    functionName,
-			output:      valueString,
-			err:         nil,
-			startedAt:   startTime,
-			completedAt: completedTime,
+			workflowID:    wfState.workflowID,
+			stepID:        stepID,
+			stepName:      functionName,
+			output:        valueString,
+			startedAt:     startTime,
+			completedAt:   completedTime,
+			serialization: serialization,
 		}
 
 		// Record an error if no event found and timeout occurred
 		if timeoutOccurred && valueString == nil {
-			recordInput.err = newTimeoutError(wfState.workflowID, functionName, fmt.Sprintf("no event found for key '%s' within %v", input.Key, input.Timeout))
-			timeoutErr = recordInput.err
+			timeoutErr = newTimeoutError(wfState.workflowID, functionName, fmt.Sprintf("no event found for key '%s' within %v", input.Key, input.Timeout))
+			s := timeoutErr.Error()
+			recordInput.errStr = &s
 		}
 
 		err = s.recordOperationResult(ctx, recordInput)
@@ -2635,8 +2718,8 @@ func (s *sysDB) getEvent(ctx context.Context, input getEventInput) (*string, err
 		}
 	}
 
-	// Return the value string pointer and the timeout error if any
-	return valueString, timeoutErr
+	// Return the event value and its serialization format
+	return &getEventResult{value: valueString, serialization: serialization}, timeoutErr
 }
 
 /*******************************/
@@ -2644,9 +2727,10 @@ func (s *sysDB) getEvent(ctx context.Context, input getEventInput) (*string, err
 /*******************************/
 
 type writeStreamDBInput struct {
-	Key   string
-	Value *string // Already serialized
-	tx    pgx.Tx
+	Key           string
+	Value         *string // Already serialized
+	tx            pgx.Tx
+	serialization string
 }
 
 type readStreamDBInput struct {
@@ -2656,8 +2740,9 @@ type readStreamDBInput struct {
 }
 
 type streamEntry struct {
-	Value  string
-	Offset int
+	Value         string
+	Offset        int
+	Serialization string
 }
 
 func (s *sysDB) writeStream(ctx context.Context, input writeStreamDBInput) error {
@@ -2691,8 +2776,8 @@ func (s *sysDB) writeStream(ctx context.Context, input writeStreamDBInput) error
 		WHERE workflow_uuid = $1 AND key = $2`,
 		pgx.Identifier{s.schema}.Sanitize())
 
-	insertQuery := fmt.Sprintf(`INSERT INTO %s.streams (workflow_uuid, key, value, "offset", function_id)
-		VALUES ($1, $2, $3, $4, $5)`,
+	insertQuery := fmt.Sprintf(`INSERT INTO %s.streams (workflow_uuid, key, value, "offset", function_id, serialization)
+		VALUES ($1, $2, $3, $4, $5, $6)`,
 		pgx.Identifier{s.schema}.Sanitize())
 
 	var err error
@@ -2711,7 +2796,7 @@ func (s *sysDB) writeStream(ctx context.Context, input writeStreamDBInput) error
 		return fmt.Errorf("failed to get next offset: %w", err)
 	}
 
-	_, err = exec(ctx, insertQuery, wfState.workflowID, input.Key, input.Value, nextOffset, wfState.stepID)
+	_, err = exec(ctx, insertQuery, wfState.workflowID, input.Key, input.Value, nextOffset, wfState.stepID, input.serialization)
 	if err != nil {
 		return fmt.Errorf("failed to insert stream entry: %w", err)
 	}
@@ -2722,7 +2807,7 @@ func (s *sysDB) writeStream(ctx context.Context, input writeStreamDBInput) error
 // readStream reads stream entries starting from a given offset.
 // Returns the entries, whether the stream is closed, and any error.
 func (s *sysDB) readStream(ctx context.Context, input readStreamDBInput) ([]streamEntry, bool, error) {
-	query := fmt.Sprintf(`SELECT value, "offset" FROM %s.streams
+	query := fmt.Sprintf(`SELECT value, "offset", serialization FROM %s.streams
 		WHERE workflow_uuid = $1 AND key = $2 AND "offset" >= $3
 		ORDER BY "offset" ASC`,
 		pgx.Identifier{s.schema}.Sanitize())
@@ -2739,7 +2824,8 @@ func (s *sysDB) readStream(ctx context.Context, input readStreamDBInput) ([]stre
 	for rows.Next() {
 		var value string
 		var offset int
-		if err := rows.Scan(&value, &offset); err != nil {
+		var serialization *string
+		if err := rows.Scan(&value, &offset, &serialization); err != nil {
 			return nil, false, fmt.Errorf("failed to scan stream entry: %w", err)
 		}
 
@@ -2748,9 +2834,14 @@ func (s *sysDB) readStream(ctx context.Context, input readStreamDBInput) ([]stre
 			break
 		}
 
+		var ser string
+		if serialization != nil {
+			ser = *serialization
+		}
 		entries = append(entries, streamEntry{
-			Value:  value,
-			Offset: offset,
+			Value:         value,
+			Offset:        offset,
+			Serialization: ser,
 		})
 	}
 
@@ -2766,9 +2857,10 @@ func (s *sysDB) readStream(ctx context.Context, input readStreamDBInput) ([]stre
 /*******************************/
 
 type dequeuedWorkflow struct {
-	id    string
-	name  string
-	input *string
+	id            string
+	name          string
+	input         *string
+	serialization string
 }
 
 type dequeueWorkflowsInput struct {
@@ -2979,16 +3071,20 @@ func (s *sysDB) dequeueWorkflows(ctx context.Context, input dequeueWorkflowsInpu
 			        ELSE workflow_deadline_epoch_ms
 			    END
 			WHERE workflow_uuid = $5
-			RETURNING name, inputs`, pgx.Identifier{s.schema}.Sanitize())
+			RETURNING name, inputs, serialization`, pgx.Identifier{s.schema}.Sanitize())
 
+		var serialization *string
 		err := tx.QueryRow(ctx, updateQuery,
 			WorkflowStatusPending,
 			input.applicationVersion,
 			input.executorID,
 			time.Now().UnixMilli(),
-			id).Scan(&retWorkflow.name, &retWorkflow.input)
+			id).Scan(&retWorkflow.name, &retWorkflow.input, &serialization)
 		if err != nil {
 			return nil, fmt.Errorf("failed to update workflow %s during dequeue: %w", id, err)
+		}
+		if serialization != nil {
+			retWorkflow.serialization = *serialization
 		}
 
 		retWorkflows = append(retWorkflows, retWorkflow)

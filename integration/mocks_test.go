@@ -366,9 +366,7 @@ func TestMocks(t *testing.T) {
 	mockCtx2 := mocks.NewMockDBOSContext(t)
 
 	// WriteStream
-	mockCtx2.On("WriteStream", mockCtx2, "stream-key", mock.MatchedBy(func(s *string) bool {
-		return s != nil
-	})).Return(nil).Once()
+	mockCtx2.On("WriteStream", mockCtx2, "stream-key", "stream-value").Return(nil).Once()
 
 	// CloseStream
 	mockCtx2.On("CloseStream", mockCtx2, "stream-key").Return(nil).Once()

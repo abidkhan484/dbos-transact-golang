@@ -26,7 +26,7 @@ type ClientConfig struct {
 type Client interface {
 	Enqueue(queueName, workflowName string, input any, opts ...EnqueueOption) (WorkflowHandle[any], error)
 	ListWorkflows(opts ...ListWorkflowsOption) ([]WorkflowStatus, error)
-	Send(destinationID string, message any, topic string) error
+	Send(destinationID string, message any, topic string, opts ...SendOption) error
 	GetEvent(targetWorkflowID, key string, timeout time.Duration) (any, error)
 	RetrieveWorkflow(workflowID string) (WorkflowHandle[any], error)
 	CancelWorkflow(workflowID string) error
@@ -125,6 +125,25 @@ func WithEnqueueQueuePartitionKey(partitionKey string) EnqueueOption {
 	}
 }
 
+// WithEnqueueClassName sets the class/namespace name for the enqueued workflow.
+// This is required when enqueueing to Python, TypeScript, or Java targets, which
+// dispatch workflows by (class_name, workflow_name) pair.
+func WithEnqueueClassName(className string) EnqueueOption {
+	return func(opts *enqueueOptions) {
+		opts.className = className
+	}
+}
+
+// WithEnqueueConfigName sets the config/instance name for the enqueued workflow.
+// This is required when enqueueing to Python, TypeScript, or Java targets that
+// register workflows on class instances (e.g. DBOSConfiguredInstance / ConfiguredInstance).
+// Pass an empty string ("") to target the default (unnamed) instance.
+func WithEnqueueConfigName(configName string) EnqueueOption {
+	return func(opts *enqueueOptions) {
+		opts.configName = &configName
+	}
+}
+
 type enqueueOptions struct {
 	workflowName       string
 	workflowID         string
@@ -134,6 +153,8 @@ type enqueueOptions struct {
 	workflowTimeout    time.Duration
 	workflowInput      any
 	queuePartitionKey  string
+	className          string
+	configName         *string
 }
 
 // EnqueueWorkflow enqueues a workflow to a named queue for deferred execution.
@@ -181,6 +202,27 @@ func (c *client) Enqueue(queueName, workflowName string, input any, opts ...Enqu
 		return nil, fmt.Errorf("priority %d exceeds maximum allowed value %d", params.priority, math.MaxInt)
 	}
 
+	// Encode input and determine serialization format
+	var encodedInput *string
+	var serialization string
+	if _, ok := input.(PortableWorkflowArgs); ok {
+		ser := newPortableSerializer[any]()
+		var err error
+		encodedInput, err = ser.Encode(input)
+		if err != nil {
+			return nil, fmt.Errorf("failed to serialize portable workflow input: %w", err)
+		}
+		serialization = PortableSerializerName
+	} else {
+		ser := resolveEncoder(dbosCtx)
+		var err error
+		encodedInput, err = ser.Encode(input)
+		if err != nil {
+			return nil, fmt.Errorf("failed to serialize workflow input: %w", err)
+		}
+		serialization = ser.Name()
+	}
+
 	status := WorkflowStatus{
 		Name:               params.workflowName,
 		ApplicationVersion: params.applicationVersion,
@@ -189,11 +231,14 @@ func (c *client) Enqueue(queueName, workflowName string, input any, opts ...Enqu
 		CreatedAt:          time.Now(),
 		Deadline:           deadline,
 		Timeout:            params.workflowTimeout,
-		Input:              input,
+		Input:              encodedInput,
 		QueueName:          queueName,
 		DeduplicationID:    params.deduplicationID,
 		Priority:           int(params.priority),
 		QueuePartitionKey:  params.queuePartitionKey,
+		ClassName:          params.className,
+		ConfigName:         params.configName,
+		Serialization:      serialization,
 	}
 
 	uncancellableCtx := WithoutCancel(dbosCtx)
@@ -271,19 +316,23 @@ func (c *client) Enqueue(queueName, workflowName string, input any, opts ...Enqu
 //	handle, err := dbos.Enqueue[MyInputType, MyOutputType](client, "my-queue", "MyWorkflow", MyInputType{Field: "value"},
 //	    dbos.WithEnqueueWorkflowID("custom-workflow-id"),
 //	    dbos.WithEnqueueDeduplicationID("unique-operation-id"))
+//
+// To enqueue a workflow for a DBOS application in another language (e.g., Python),
+// pass a [PortableWorkflowArgs] as the input. This automatically uses portable JSON
+// serialization, encoding the envelope with positional and named arguments:
+//
+//	args := dbos.PortableWorkflowArgs{
+//	    PositionalArgs: []any{"hello", 42},
+//	    NamedArgs:      map[string]any{"key": "value"},
+//	}
+//	handle, err := dbos.Enqueue[dbos.PortableWorkflowArgs, any](client, "queue", "py_workflow", args)
 func Enqueue[P any, R any](c Client, queueName, workflowName string, input P, opts ...EnqueueOption) (WorkflowHandle[R], error) {
 	if c == nil {
 		return nil, errors.New("client cannot be nil")
 	}
 
-	// Serialize input
-	encodedInput, err := encodeValue(c.(*client).dbosCtx.(*dbosContext).serializer, input)
-	if err != nil {
-		return nil, fmt.Errorf("failed to serialize workflow input: %w", err)
-	}
-
-	// Call the interface method with the same signature
-	handle, err := c.Enqueue(queueName, workflowName, encodedInput, opts...)
+	// Call the interface method — encoding happens there
+	handle, err := c.Enqueue(queueName, workflowName, input, opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -297,13 +346,21 @@ func (c *client) ListWorkflows(opts ...ListWorkflowsOption) ([]WorkflowStatus, e
 }
 
 // Send sends a message to another workflow.
-func (c *client) Send(destinationID string, message any, topic string) error {
-	return c.dbosCtx.Send(c.dbosCtx, destinationID, message, topic)
+func (c *client) Send(destinationID string, message any, topic string, opts ...SendOption) error {
+	return c.dbosCtx.Send(c.dbosCtx, destinationID, message, topic, opts...)
 }
 
 // GetEvent retrieves a key-value event from a target workflow.
 func (c *client) GetEvent(targetWorkflowID, key string, timeout time.Duration) (any, error) {
-	return c.dbosCtx.GetEvent(c.dbosCtx, targetWorkflowID, key, timeout)
+	result, err := c.dbosCtx.GetEvent(c.dbosCtx, targetWorkflowID, key, timeout)
+	if err != nil {
+		return nil, err
+	}
+	// Unwrap the internal result type for the public API
+	if evtResult, ok := result.(*getEventResult); ok {
+		return evtResult.value, nil
+	}
+	return result, nil
 }
 
 // RetrieveWorkflow returns a handle to an existing workflow.
@@ -370,15 +427,19 @@ func ClientReadStream[R any](c Client, workflowID string, key string) ([]R, bool
 		return nil, false, err
 	}
 
-	// Decode each value to type R
+	// Decode each value using the serialization stored with that stream entry.
 	customSer := c.(*client).dbosCtx.(*dbosContext).serializer
 	typedValues := make([]R, len(values))
 	for i, val := range values {
-		encodedStr, ok := val.(string)
+		entry, ok := val.(streamEntryWithSerialization)
 		if !ok {
-			return nil, false, fmt.Errorf("stream value is not a string, got %T", val)
+			return nil, false, fmt.Errorf("stream value is not streamEntryWithSerialization, got %T", val)
 		}
-		decodedValue, decodeErr := decodeValue[R](customSer, &encodedStr)
+		decoder, resolveErr := resolveDecoder[R](entry.serialization, customSer)
+		if resolveErr != nil {
+			return nil, false, resolveErr
+		}
+		decodedValue, decodeErr := decoder.Decode(&entry.value)
 		if decodeErr != nil {
 			return nil, false, fmt.Errorf("decoding stream value to type %T: %w", *new(R), decodeErr)
 		}
@@ -446,13 +507,19 @@ func ClientReadStreamAsync[R any](c Client, workflowID string, key string) (<-ch
 				return
 			}
 
-			encodedStr, ok := streamValue.Value.(string)
+			entry, ok := streamValue.Value.(streamEntryWithSerialization)
 			if !ok {
-				typedCh <- StreamValue[R]{Err: fmt.Errorf("stream value is not a string, got %T", streamValue.Value)}
+				typedCh <- StreamValue[R]{Err: fmt.Errorf("stream value is not streamEntryWithSerialization, got %T", streamValue.Value)}
 				return
 			}
 
-			decodedValue, decodeErr := decodeValue[R](customSer, &encodedStr)
+			decoder, resolveErr := resolveDecoder[R](entry.serialization, customSer)
+			if resolveErr != nil {
+				typedCh <- StreamValue[R]{Err: resolveErr}
+				return
+			}
+
+			decodedValue, decodeErr := decoder.Decode(&entry.value)
 			if decodeErr != nil {
 				typedCh <- StreamValue[R]{Err: fmt.Errorf("decoding stream value to type %T: %w", *new(R), decodeErr)}
 				return

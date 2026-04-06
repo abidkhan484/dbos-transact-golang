@@ -105,7 +105,7 @@ func testAllSerializationPaths[T any](
 	})
 
 	// Check the last step output (the workflow result)
-	customSer := getCustomSerializer(executor)
+	customSer := getCustomSerializerFromCtx(executor)
 	t.Run("GetWorkflowSteps", func(t *testing.T) {
 		steps, err := GetWorkflowSteps(executor, handle.GetWorkflowID())
 		require.NoError(t, err)
@@ -968,25 +968,25 @@ func init() {
 }
 
 var (
-	gobRecoveryStructWorkflow     = makeRecoveryWorkflow[TestWorkflowData]()
-	gobRecoveryIntWorkflow        = makeRecoveryWorkflow[int]()
-	gobRecoveryStringWorkflow     = makeRecoveryWorkflow[string]()
-	gobRecoveryIntSliceWorkflow   = makeRecoveryWorkflow[[]int]()
-	gobRecoveryMapWorkflow        = makeRecoveryWorkflow[map[string]int]()
-	gobRecoveryMyIntWorkflow      = makeRecoveryWorkflow[MyInt]()
-	gobRecoveryGobOnlyWorkflow    = makeRecoveryWorkflow[GobOnlyType]()
-	gobSenderWorkflow             = makeSenderWorkflow[TestWorkflowData]()
-	gobReceiverWorkflow           = makeReceiverWorkflow[TestWorkflowData]()
-	gobSetEventWorkflow           = makeSetEventWorkflow[TestWorkflowData]()
-	gobGetEventWorkflow           = makeGetEventWorkflow[TestWorkflowData]()
-	gobGobOnlyWorkflow            = makeTestWorkflow[GobOnlyType]()
-	gobGobOnlySenderWorkflow      = makeSenderWorkflow[GobOnlyType]()
-	gobGobOnlyReceiverWorkflow    = makeReceiverWorkflow[GobOnlyType]()
-	gobGobOnlySetEventWorkflow    = makeSetEventWorkflow[GobOnlyType]()
-	gobGobOnlyGetEventWorkflow    = makeGetEventWorkflow[GobOnlyType]()
-	gobStreamWorkflow             = makeStreamWorkflow[TestWorkflowData]()
-	gobGobOnlyStreamWorkflow      = makeStreamWorkflow[GobOnlyType]()
-	gobQueuedWorkflow             = makeTestWorkflow[TestWorkflowData]()
+	gobRecoveryStructWorkflow   = makeRecoveryWorkflow[TestWorkflowData]()
+	gobRecoveryIntWorkflow      = makeRecoveryWorkflow[int]()
+	gobRecoveryStringWorkflow   = makeRecoveryWorkflow[string]()
+	gobRecoveryIntSliceWorkflow = makeRecoveryWorkflow[[]int]()
+	gobRecoveryMapWorkflow      = makeRecoveryWorkflow[map[string]int]()
+	gobRecoveryMyIntWorkflow    = makeRecoveryWorkflow[MyInt]()
+	gobRecoveryGobOnlyWorkflow  = makeRecoveryWorkflow[GobOnlyType]()
+	gobSenderWorkflow           = makeSenderWorkflow[TestWorkflowData]()
+	gobReceiverWorkflow         = makeReceiverWorkflow[TestWorkflowData]()
+	gobSetEventWorkflow         = makeSetEventWorkflow[TestWorkflowData]()
+	gobGetEventWorkflow         = makeGetEventWorkflow[TestWorkflowData]()
+	gobGobOnlyWorkflow          = makeTestWorkflow[GobOnlyType]()
+	gobGobOnlySenderWorkflow    = makeSenderWorkflow[GobOnlyType]()
+	gobGobOnlyReceiverWorkflow  = makeReceiverWorkflow[GobOnlyType]()
+	gobGobOnlySetEventWorkflow  = makeSetEventWorkflow[GobOnlyType]()
+	gobGobOnlyGetEventWorkflow  = makeGetEventWorkflow[GobOnlyType]()
+	gobStreamWorkflow           = makeStreamWorkflow[TestWorkflowData]()
+	gobGobOnlyStreamWorkflow    = makeStreamWorkflow[GobOnlyType]()
+	gobQueuedWorkflow           = makeTestWorkflow[TestWorkflowData]()
 )
 
 // TestGobSerializer tests the built-in gob serializer through all workflow paths.
@@ -1021,11 +1021,11 @@ func TestGobSerializer(t *testing.T) {
 
 	t.Run("Struct", func(t *testing.T) {
 		input := TestWorkflowData{
-			ID:      "gob-test",
-			Message: "gob message",
-			Value:   42,
-			Active:  true,
-			Data:    TestData{Message: "embedded", Value: 123, Active: false},
+			ID:       "gob-test",
+			Message:  "gob message",
+			Value:    42,
+			Active:   true,
+			Data:     TestData{Message: "embedded", Value: 123, Active: false},
 			Metadata: map[string]string{"key": "value"},
 			NestedSlice: []NestedTestData{
 				{Key: "nested1", Count: 10},
@@ -1078,7 +1078,7 @@ func TestGobSerializer(t *testing.T) {
 	t.Run("SendRecv", func(t *testing.T) {
 		input := TestWorkflowData{
 			ID: "gob-sendrecv", Message: "gob msg", Value: 99,
-			Data: TestData{Message: "nested", Value: 200},
+			Data:     TestData{Message: "nested", Value: 200},
 			Metadata: map[string]string{"comm": "gob"},
 		}
 		testSendRecv(t, executor, gobSenderWorkflow, gobReceiverWorkflow, input, "gob-sender-wf")
@@ -1087,7 +1087,7 @@ func TestGobSerializer(t *testing.T) {
 	t.Run("SetGetEvent", func(t *testing.T) {
 		input := TestWorkflowData{
 			ID: "gob-event", Message: "gob event", Value: 77,
-			Data: TestData{Message: "event nested", Value: 333},
+			Data:     TestData{Message: "event nested", Value: 333},
 			Metadata: map[string]string{"type": "gob-event"},
 		}
 		testSetGetEvent(t, executor, gobSetEventWorkflow, gobGetEventWorkflow, input, "gob-setevent-wf", "gob-getevent-wf")
@@ -1109,7 +1109,7 @@ func TestGobSerializer(t *testing.T) {
 	t.Run("WriteReadStream", func(t *testing.T) {
 		input := TestWorkflowData{
 			ID: "gob-stream", Message: "stream data", Value: 55,
-			Data: TestData{Message: "streamed", Value: 555},
+			Data:     TestData{Message: "streamed", Value: 555},
 			Metadata: map[string]string{"stream": "gob"},
 		}
 		handle, err := RunWorkflow(executor, gobStreamWorkflow, input, WithWorkflowID("gob-stream-wf"))
@@ -1147,7 +1147,7 @@ func TestGobSerializer(t *testing.T) {
 	t.Run("QueuedWorkflow", func(t *testing.T) {
 		input := TestWorkflowData{
 			ID: "gob-queued", Message: "queued msg", Value: 88,
-			Data: TestData{Message: "queued", Value: 888},
+			Data:     TestData{Message: "queued", Value: 888},
 			Metadata: map[string]string{"type": "gob-queued"},
 		}
 		handle, err := RunWorkflow(executor, gobQueuedWorkflow, input, WithWorkflowID("gob-queued-wf"), WithQueue(gobTestQueue.Name))
@@ -1421,5 +1421,933 @@ func TestChickenSerializer(t *testing.T) {
 		assert.True(t, closed)
 		require.Len(t, values, 1)
 		assert.Equal(t, fixedChicken, values[0])
+	})
+}
+
+// TestPortableInterop tests cross-language interoperability using the portable JSON format.
+// It simulates another language inserting a workflow into the DB with portable_json serialization,
+// and verifies that Go can recover and execute it correctly.
+func TestPortableInterop(t *testing.T) {
+	executor := setupDBOS(t, setupDBOSOptions{dropDB: true, checkLeaks: true})
+
+	// InteropInput exercises the full portable JSON value space:
+	// strings, integers, floats, booleans, nulls, arrays, nested objects, RFC3339 timestamps
+	type NestedObj struct {
+		Deep bool `json:"deep"`
+	}
+	type MapArg struct {
+		Key1   string    `json:"key1"`
+		Key2   int       `json:"key2"`
+		Nested NestedObj `json:"nested"`
+	}
+
+	// The workflow accepts 7 positional args matching the golden JSON below.
+	// Go workflows take a single input param, so we use a struct that mirrors the positional args.
+	type InteropArgs struct {
+		Str       string   `json:"str"`
+		Num       int      `json:"num"`
+		Timestamp string   `json:"timestamp"`
+		Arr       []string `json:"arr"`
+		Obj       MapArg   `json:"obj"`
+		Flag      bool     `json:"flag"`
+		Nullable  *string  `json:"nullable"`
+	}
+
+	expectedArgs := InteropArgs{
+		Str:       "hello-interop",
+		Num:       42,
+		Timestamp: "2025-06-15T10:30:00.000Z",
+		Arr:       []string{"alpha", "beta", "gamma"},
+		Obj:       MapArg{Key1: "value1", Key2: 99, Nested: NestedObj{Deep: true}},
+		Flag:      true,
+		Nullable:  nil,
+	}
+
+	// Golden JSON matching what Python/TS would produce, including namedArgs (ignored by Go)
+	goldenInputsJSON := `{"positionalArgs":[{"str":"hello-interop","num":42,"timestamp":"2025-06-15T10:30:00.000Z","arr":["alpha","beta","gamma"],"obj":{"key1":"value1","key2":99,"nested":{"deep":true}},"flag":true,"nullable":null}],"namedArgs":{"unused_kwarg":"should_be_ignored","another":123}}`
+
+	// InteropResult captures intermediate results to prove each encode/decode path works.
+	type InteropResult struct {
+		Input        InteropArgs `json:"input"`
+		StepOutput   InteropArgs `json:"stepOutput"`
+		RecvOutput   InteropArgs `json:"recvOutput"`
+		EventOutput  InteropArgs `json:"eventOutput"`
+		StreamOutput InteropArgs `json:"streamOutput"`
+	}
+
+	// A single workflow that exercises all serialization paths:
+	// step output, send/recv, set_event/get_event, and write_stream/read_stream.
+	portableWf := func(ctx DBOSContext, input InteropArgs) (InteropResult, error) {
+		// 1. Step: encode/decode step output
+		stepOut, err := RunAsStep(ctx, func(_ context.Context) (InteropArgs, error) {
+			return input, nil
+		})
+		if err != nil {
+			return InteropResult{}, fmt.Errorf("step failed: %w", err)
+		}
+
+		// 2. Send to self, then Recv
+		wfID, err := GetWorkflowID(ctx)
+		if err != nil {
+			return InteropResult{}, err
+		}
+		if err := Send(ctx, wfID, input, "test-topic"); err != nil {
+			return InteropResult{}, fmt.Errorf("send failed: %w", err)
+		}
+		recvOut, err := Recv[InteropArgs](ctx, "test-topic", 10*time.Second)
+		if err != nil {
+			return InteropResult{}, fmt.Errorf("recv failed: %w", err)
+		}
+
+		// 3. SetEvent then GetEvent (from own workflow)
+		if err := SetEvent(ctx, "test-key", input); err != nil {
+			return InteropResult{}, fmt.Errorf("set event failed: %w", err)
+		}
+		eventOut, err := GetEvent[InteropArgs](ctx, wfID, "test-key", 10*time.Second)
+		if err != nil {
+			return InteropResult{}, fmt.Errorf("get event failed: %w", err)
+		}
+
+		// 4. Stream: write, close, then read back
+		if err := WriteStream(ctx, "test-stream", input); err != nil {
+			return InteropResult{}, fmt.Errorf("write stream failed: %w", err)
+		}
+		if err := CloseStream(ctx, "test-stream"); err != nil {
+			return InteropResult{}, fmt.Errorf("close stream failed: %w", err)
+		}
+		streamValues, closed, err := ReadStream[InteropArgs](ctx, wfID, "test-stream")
+		if err != nil {
+			return InteropResult{}, fmt.Errorf("read stream failed: %w", err)
+		}
+		if !closed {
+			return InteropResult{}, fmt.Errorf("expected stream to be closed")
+		}
+		if len(streamValues) != 1 {
+			return InteropResult{}, fmt.Errorf("expected 1 stream value, got %d", len(streamValues))
+		}
+
+		return InteropResult{
+			Input:        input,
+			StepOutput:   stepOut,
+			RecvOutput:   recvOut,
+			EventOutput:  eventOut,
+			StreamOutput: streamValues[0],
+		}, nil
+	}
+	RegisterWorkflow(executor, portableWf, WithWorkflowName("interop_workflow"))
+	NewWorkflowQueue(executor, "portable-interop-queue")
+
+	require.NoError(t, Launch(executor))
+	defer Shutdown(executor, 10*time.Second)
+
+	// Helper to insert a portable workflow directly into the DB (simulating another language).
+	insertPortableWorkflow := func(t *testing.T, workflowID, status string, queueName *string) {
+		t.Helper()
+		c := executor.(*dbosContext)
+		sysDB := c.systemDB.(*sysDB)
+		insertQuery := fmt.Sprintf(`INSERT INTO %s.workflow_status (
+			workflow_uuid, status, name, inputs, serialization, queue_name,
+			created_at, updated_at, recovery_attempts, executor_id, priority,
+			application_version, application_id, authenticated_user, assumed_role, authenticated_roles
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)`,
+			pgx.Identifier{sysDB.schema}.Sanitize())
+		now := time.Now().UnixMilli()
+		_, err := sysDB.pool.Exec(context.Background(), insertQuery,
+			workflowID, status, "interop_workflow", goldenInputsJSON, PortableSerializerName, queueName,
+			now, now, 0, "local", 0, c.applicationVersion, "", "", "", "[]")
+		require.NoError(t, err)
+	}
+
+	// verifyResult checks all intermediate results match expectedArgs.
+	verifyResult := func(t *testing.T, result InteropResult) {
+		t.Helper()
+		assert.Equal(t, expectedArgs, result.Input, "workflow input")
+		assert.Equal(t, expectedArgs, result.StepOutput, "step output")
+		assert.Equal(t, expectedArgs, result.RecvOutput, "recv output")
+		assert.Equal(t, expectedArgs, result.EventOutput, "event output")
+		assert.Equal(t, expectedArgs, result.StreamOutput, "stream output")
+	}
+
+	// 1. Recovery path: direct DB insert with status=PENDING, then recover.
+	t.Run("DirectDBInsertRecovery", func(t *testing.T) {
+		workflowID := "interop-recovery-" + t.Name()
+		insertPortableWorkflow(t, workflowID, string(WorkflowStatusPending), nil)
+
+		c := executor.(*dbosContext)
+		handles, err := recoverPendingWorkflows(c, []string{"local"})
+		require.NoError(t, err)
+		require.Len(t, handles, 1)
+
+		_, err = handles[0].GetResult()
+		require.NoError(t, err)
+
+		retrievedHandle, err := RetrieveWorkflow[InteropResult](executor, workflowID)
+		require.NoError(t, err)
+		result, err := retrievedHandle.GetResult()
+		require.NoError(t, err)
+		verifyResult(t, result)
+
+		// Verify ListWorkflows returns portable inputs/outputs correctly
+		wfs, err := ListWorkflows(executor,
+			WithWorkflowIDs([]string{workflowID}),
+			WithLoadInput(true), WithLoadOutput(true))
+		require.NoError(t, err)
+		require.Len(t, wfs, 1)
+		wf := wfs[0]
+		assert.Equal(t, PortableSerializerName, wf.Serialization)
+
+		require.NotNil(t, wf.Input)
+		inputStr, ok := wf.Input.(string)
+		require.True(t, ok, "expected string for portable input, got %T", wf.Input)
+		assert.True(t, json.Valid([]byte(inputStr)), "input should be valid JSON")
+		var envelope PortableWorkflowArgs
+		require.NoError(t, json.Unmarshal([]byte(inputStr), &envelope))
+		assert.Len(t, envelope.PositionalArgs, 1)
+
+		require.NotNil(t, wf.Output)
+		outputStr, ok := wf.Output.(string)
+		require.True(t, ok, "expected string for portable output, got %T", wf.Output)
+		assert.True(t, json.Valid([]byte(outputStr)), "output should be valid JSON")
+		var outputMap map[string]any
+		require.NoError(t, json.Unmarshal([]byte(outputStr), &outputMap))
+		assert.Contains(t, outputMap, "input")
+		assert.Contains(t, outputMap, "stepOutput")
+		assert.Contains(t, outputMap, "recvOutput")
+		assert.Contains(t, outputMap, "eventOutput")
+	})
+
+	// 2. Queue path: direct DB insert with status=ENQUEUED + queue_name, let the queue runner dequeue.
+	t.Run("DirectDBInsertQueue", func(t *testing.T) {
+		workflowID := "interop-queue-" + t.Name()
+		queueName := "portable-interop-queue"
+		insertPortableWorkflow(t, workflowID, string(WorkflowStatusEnqueued), &queueName)
+
+		retrievedHandle, err := RetrieveWorkflow[InteropResult](executor, workflowID)
+		require.NoError(t, err)
+		result, err := retrievedHandle.GetResult()
+		require.NoError(t, err)
+		verifyResult(t, result)
+	})
+
+	// 3. Client enqueue path: Go client with PortableWorkflowArgs.
+	t.Run("ClientEnqueuePortable", func(t *testing.T) {
+		client, err := NewClient(context.Background(), ClientConfig{
+			DatabaseURL: getDatabaseURL(),
+		})
+		require.NoError(t, err)
+		t.Cleanup(func() { client.Shutdown(5 * time.Second) })
+
+		portableArgs := PortableWorkflowArgs{
+			PositionalArgs: []any{expectedArgs, "extra-positional", 99},
+			NamedArgs:      map[string]any{"lang": "python", "debug": true},
+		}
+		handle, err := Enqueue[PortableWorkflowArgs, InteropResult](client, "portable-interop-queue", "interop_workflow", portableArgs)
+		require.NoError(t, err)
+		require.NotEmpty(t, handle.GetWorkflowID())
+
+		// Verify the DB has portable_json serialization and the correct envelope
+		c := executor.(*dbosContext)
+		sysDB := c.systemDB.(*sysDB)
+		var storedInputs, storedSerialization string
+		selectQuery := fmt.Sprintf(`SELECT inputs, serialization FROM %s.workflow_status WHERE workflow_uuid = $1`,
+			pgx.Identifier{sysDB.schema}.Sanitize())
+		err = sysDB.pool.QueryRow(context.Background(), selectQuery, handle.GetWorkflowID()).Scan(&storedInputs, &storedSerialization)
+		require.NoError(t, err)
+		assert.Equal(t, PortableSerializerName, storedSerialization)
+
+		// Verify envelope format — extra positional/named args are preserved in the DB
+		var envelope PortableWorkflowArgs
+		require.NoError(t, json.Unmarshal([]byte(storedInputs), &envelope))
+		assert.Len(t, envelope.PositionalArgs, 3)
+		assert.Len(t, envelope.NamedArgs, 2)
+
+		// Wait for execution and verify all paths
+		retrievedHandle, err := RetrieveWorkflow[InteropResult](executor, handle.GetWorkflowID())
+		require.NoError(t, err)
+		result, err := retrievedHandle.GetResult()
+		require.NoError(t, err)
+		verifyResult(t, result)
+	})
+
+	// 4. Wrong-type input: enqueue with a string where InteropArgs is expected.
+	// Go's type system catches this during deserialization; the workflow should fail.
+	t.Run("WrongTypeInput", func(t *testing.T) {
+		workflowID := "interop-wrongtype-" + t.Name()
+		queueName := "portable-interop-queue"
+		badInputsJSON := `{"positionalArgs":["not-an-object"],"namedArgs":{}}`
+
+		c := executor.(*dbosContext)
+		sysDB := c.systemDB.(*sysDB)
+		insertQuery := fmt.Sprintf(`INSERT INTO %s.workflow_status (
+			workflow_uuid, status, name, inputs, serialization, queue_name,
+			created_at, updated_at, recovery_attempts, executor_id, priority,
+			application_version, application_id, authenticated_user, assumed_role, authenticated_roles
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)`,
+			pgx.Identifier{sysDB.schema}.Sanitize())
+		now := time.Now().UnixMilli()
+		_, err := sysDB.pool.Exec(context.Background(), insertQuery,
+			workflowID, string(WorkflowStatusEnqueued), "interop_workflow", badInputsJSON, PortableSerializerName, &queueName,
+			now, now, 0, "local", 0, c.applicationVersion, "", "", "", "[]")
+		require.NoError(t, err)
+
+		retrievedHandle, err := RetrieveWorkflow[InteropResult](executor, workflowID)
+		require.NoError(t, err)
+		_, err = retrievedHandle.GetResult()
+		require.Error(t, err)
+		var pe *PortableWorkflowError
+		require.ErrorAs(t, err, &pe)
+		assert.Equal(t, "Portable Error", pe.Name)
+		assert.Contains(t, err.Error(), "DBOS Error 10")
+	})
+}
+
+// TestPortablePerOperationOptions verifies that WithPortableSend, WithPortableSetEvent, and
+// WithPortableWriteStream force portable_json serialization for individual operations,
+// even when the calling workflow uses the default serializer.
+func TestPortablePerOperationOptions(t *testing.T) {
+	executor := setupDBOS(t, setupDBOSOptions{dropDB: true, checkLeaks: true})
+
+	type Payload struct {
+		Name  string `json:"name"`
+		Count int    `json:"count"`
+	}
+
+	payload := Payload{Name: "portable-op", Count: 7}
+
+	c := executor.(*dbosContext)
+	sysDB := c.systemDB.(*sysDB)
+
+	// Helper: fetch the serialization recorded in operation_outputs for the Recv step of a workflow.
+	// The Recv step stores the serialization of the message it consumed, which reflects what the sender used.
+	recvStepSerialization := func(t *testing.T, workflowID string) string {
+		t.Helper()
+		var ser string
+		q := fmt.Sprintf(`SELECT serialization FROM %s.operation_outputs WHERE workflow_uuid = $1 AND function_name = 'DBOS.recv' ORDER BY function_id ASC LIMIT 1`,
+			pgx.Identifier{sysDB.schema}.Sanitize())
+		require.NoError(t, sysDB.pool.QueryRow(context.Background(), q, workflowID).Scan(&ser))
+		return ser
+	}
+
+	// Helper: fetch the serialization column for a workflow event.
+	eventSerialization := func(t *testing.T, workflowID, key string) string {
+		t.Helper()
+		var ser string
+		q := fmt.Sprintf(`SELECT serialization FROM %s.workflow_events WHERE workflow_uuid = $1 AND key = $2`,
+			pgx.Identifier{sysDB.schema}.Sanitize())
+		require.NoError(t, sysDB.pool.QueryRow(context.Background(), q, workflowID, key).Scan(&ser))
+		return ser
+	}
+
+	// Helper: fetch the serialization column for the first stream entry (non-sentinel).
+	streamSerialization := func(t *testing.T, workflowID, key string) string {
+		t.Helper()
+		var ser string
+		q := fmt.Sprintf(`SELECT serialization FROM %s.streams WHERE workflow_uuid = $1 AND key = $2 AND value != $3 ORDER BY "offset" LIMIT 1`,
+			pgx.Identifier{sysDB.schema}.Sanitize())
+		require.NoError(t, sysDB.pool.QueryRow(context.Background(), q, workflowID, key, _DBOS_STREAM_CLOSED_SENTINEL).Scan(&ser))
+		return ser
+	}
+
+	// Workflows must be registered before Launch.
+	var (
+		portableSendSenderWf   Workflow[string, string]
+		portableSendReceiverWf Workflow[string, Payload]
+		portableSetterWf       Workflow[string, string]
+		portableGetterWf       Workflow[string, Payload]
+		portableWriterWf       Workflow[string, string]
+	)
+
+	portableSendSenderWf = func(ctx DBOSContext, receiverID string) (string, error) {
+		return "", Send(ctx, receiverID, payload, "topic", WithPortableSend())
+	}
+	portableSendReceiverWf = func(ctx DBOSContext, _ string) (Payload, error) {
+		return Recv[Payload](ctx, "topic", 10*time.Second)
+	}
+	portableSetterWf = func(ctx DBOSContext, _ string) (string, error) {
+		return "", SetEvent(ctx, "evt-key", payload, WithPortableSetEvent())
+	}
+	portableGetterWf = func(ctx DBOSContext, targetID string) (Payload, error) {
+		return GetEvent[Payload](ctx, targetID, "evt-key", 10*time.Second)
+	}
+	portableWriterWf = func(ctx DBOSContext, _ string) (string, error) {
+		if err := WriteStream(ctx, "stream-key", payload, WithPortableWriteStream()); err != nil {
+			return "", err
+		}
+		return "", CloseStream(ctx, "stream-key")
+	}
+
+	RegisterWorkflow(executor, portableSendSenderWf, WithWorkflowName("portable-op-send-sender"))
+	RegisterWorkflow(executor, portableSendReceiverWf, WithWorkflowName("portable-op-send-receiver"))
+	RegisterWorkflow(executor, portableSetterWf, WithWorkflowName("portable-op-setter"))
+	RegisterWorkflow(executor, portableGetterWf, WithWorkflowName("portable-op-getter"))
+	RegisterWorkflow(executor, portableWriterWf, WithWorkflowName("portable-op-writer"))
+
+	require.NoError(t, Launch(executor))
+	defer Shutdown(executor, 10*time.Second)
+
+	// WithPortableSend: a standard workflow sends with portable serialization; a standard
+	// workflow Recvs it and gets the correct value back. The serialization recorded in the
+	// receiver's Recv step output reflects what the sender used.
+	t.Run("WithPortableSend", func(t *testing.T) {
+		receiverID := "portable-op-send-receiver-" + t.Name()
+		senderID := "portable-op-send-sender-" + t.Name()
+
+		receiverHandle, err := RunWorkflow(executor, portableSendReceiverWf, "", WithWorkflowID(receiverID))
+		require.NoError(t, err)
+
+		_, err = RunWorkflow(executor, portableSendSenderWf, receiverID, WithWorkflowID(senderID))
+		require.NoError(t, err)
+
+		result, err := receiverHandle.GetResult()
+		require.NoError(t, err)
+		assert.Equal(t, payload, result)
+
+		// The Recv step records the serialization of the consumed message in operation_outputs.
+		assert.Equal(t, PortableSerializerName, recvStepSerialization(t, receiverID))
+	})
+
+	// WithPortableSetEvent: a standard workflow sets an event with portable serialization;
+	// a standard GetEvent reads it back correctly.
+	t.Run("WithPortableSetEvent", func(t *testing.T) {
+		setterID := "portable-op-setter-" + t.Name()
+		getterID := "portable-op-getter-" + t.Name()
+
+		setHandle, err := RunWorkflow(executor, portableSetterWf, "", WithWorkflowID(setterID))
+		require.NoError(t, err)
+		_, err = setHandle.GetResult()
+		require.NoError(t, err)
+
+		assert.Equal(t, PortableSerializerName, eventSerialization(t, setterID, "evt-key"))
+
+		getHandle, err := RunWorkflow(executor, portableGetterWf, setterID, WithWorkflowID(getterID))
+		require.NoError(t, err)
+		result, err := getHandle.GetResult()
+		require.NoError(t, err)
+		assert.Equal(t, payload, result)
+	})
+
+	// WithPortableWriteStream: a standard workflow writes with portable serialization;
+	// ReadStream reads it back correctly.
+	t.Run("WithPortableWriteStream", func(t *testing.T) {
+		wfID := "portable-op-writer-" + t.Name()
+
+		handle, err := RunWorkflow(executor, portableWriterWf, "", WithWorkflowID(wfID))
+		require.NoError(t, err)
+		_, err = handle.GetResult()
+		require.NoError(t, err)
+
+		assert.Equal(t, PortableSerializerName, streamSerialization(t, wfID, "stream-key"))
+
+		values, closed, err := ReadStream[Payload](executor, wfID, "stream-key")
+		require.NoError(t, err)
+		assert.True(t, closed)
+		require.Len(t, values, 1)
+		assert.Equal(t, payload, values[0])
+	})
+}
+
+// TestDirectRunPortableWorkflow tests starting a workflow in portable mode via RunWorkflow,
+// verifying the DB contains the correct portable JSON envelope, then recovering it.
+func TestDirectRunPortableWorkflow(t *testing.T) {
+	executor := setupDBOS(t, setupDBOSOptions{dropDB: true, checkLeaks: true})
+
+	type InteropInput struct {
+		Name  string `json:"name"`
+		Value int    `json:"value"`
+	}
+
+	expectedInput := InteropInput{Name: "direct-portable", Value: 99}
+
+	// Simple workflow that returns its input through a step (exercises encode/decode).
+	portableEchoWf := func(ctx DBOSContext, input InteropInput) (InteropInput, error) {
+		stepOut, err := RunAsStep(ctx, func(_ context.Context) (InteropInput, error) {
+			return input, nil
+		})
+		if err != nil {
+			return InteropInput{}, err
+		}
+		return stepOut, nil
+	}
+	RegisterWorkflow(executor, portableEchoWf, WithWorkflowName("portable_echo"))
+
+	// Workflow that accepts the full PortableWorkflowArgs envelope directly.
+	portableEnvelopeWf := func(ctx DBOSContext, input PortableWorkflowArgs) (PortableWorkflowArgs, error) {
+		stepOut, err := RunAsStep(ctx, func(_ context.Context) (PortableWorkflowArgs, error) {
+			return input, nil
+		})
+		if err != nil {
+			return PortableWorkflowArgs{}, err
+		}
+		return stepOut, nil
+	}
+	RegisterWorkflow(executor, portableEnvelopeWf, WithWorkflowName("portable_envelope"))
+
+	// Workflows for primitive input tests (int, string).
+	portableIntEchoWf := func(ctx DBOSContext, input int) (int, error) {
+		return RunAsStep(ctx, func(_ context.Context) (int, error) { return input, nil })
+	}
+	RegisterWorkflow(executor, portableIntEchoWf, WithWorkflowName("portable_int_echo"))
+
+	portableStringEchoWf := func(ctx DBOSContext, input string) (string, error) {
+		return RunAsStep(ctx, func(_ context.Context) (string, error) { return input, nil })
+	}
+	RegisterWorkflow(executor, portableStringEchoWf, WithWorkflowName("portable_string_echo"))
+
+	// Multi-step workflow for partial recovery test (must register before Launch).
+	type PartialRecoveryResult struct {
+		StepOut  InteropInput `json:"stepOut"`
+		RecvOut  InteropInput `json:"recvOut"`
+		EventOut InteropInput `json:"eventOut"`
+	}
+	multiStepWf := func(ctx DBOSContext, input InteropInput) (PartialRecoveryResult, error) {
+		stepOut, err := RunAsStep(ctx, func(_ context.Context) (InteropInput, error) {
+			return input, nil
+		})
+		if err != nil {
+			return PartialRecoveryResult{}, fmt.Errorf("step: %w", err)
+		}
+
+		wfID, err := GetWorkflowID(ctx)
+		if err != nil {
+			return PartialRecoveryResult{}, err
+		}
+		if err := Send(ctx, wfID, input, "partial-topic"); err != nil {
+			return PartialRecoveryResult{}, fmt.Errorf("send: %w", err)
+		}
+		recvOut, err := Recv[InteropInput](ctx, "partial-topic", 10*time.Second)
+		if err != nil {
+			return PartialRecoveryResult{}, fmt.Errorf("recv: %w", err)
+		}
+
+		if err := SetEvent(ctx, "partial-key", input); err != nil {
+			return PartialRecoveryResult{}, fmt.Errorf("setEvent: %w", err)
+		}
+		eventOut, err := GetEvent[InteropInput](ctx, wfID, "partial-key", 10*time.Second)
+		if err != nil {
+			return PartialRecoveryResult{}, fmt.Errorf("getEvent: %w", err)
+		}
+
+		return PartialRecoveryResult{StepOut: stepOut, RecvOut: recvOut, EventOut: eventOut}, nil
+	}
+	RegisterWorkflow(executor, multiStepWf, WithWorkflowName("partial_recovery_wf"))
+
+	require.NoError(t, Launch(executor))
+	defer Shutdown(executor, 10*time.Second)
+
+	c := executor.(*dbosContext)
+	sysDB := c.systemDB.(*sysDB)
+
+	// Helper: read the stored inputs and serialization from the DB.
+	readStoredInputs := func(t *testing.T, workflowID string) (string, string) {
+		t.Helper()
+		var storedInputs, storedSerialization string
+		q := fmt.Sprintf(`SELECT inputs, serialization FROM %s.workflow_status WHERE workflow_uuid = $1`,
+			pgx.Identifier{sysDB.schema}.Sanitize())
+		err := sysDB.pool.QueryRow(context.Background(), q, workflowID).Scan(&storedInputs, &storedSerialization)
+		require.NoError(t, err)
+		return storedInputs, storedSerialization
+	}
+
+	// Helper: flip a completed workflow back to PENDING for recovery.
+	resetToPending := func(t *testing.T, workflowID string) {
+		t.Helper()
+		q := fmt.Sprintf(`UPDATE %s.workflow_status SET status = $1, output = NULL, error = NULL WHERE workflow_uuid = $2`,
+			pgx.Identifier{sysDB.schema}.Sanitize())
+		_, err := sysDB.pool.Exec(context.Background(), q, string(WorkflowStatusPending), workflowID)
+		require.NoError(t, err)
+		// Also clear operation outputs so the workflow re-executes its steps.
+		dq := fmt.Sprintf(`DELETE FROM %s.operation_outputs WHERE workflow_uuid = $1`,
+			pgx.Identifier{sysDB.schema}.Sanitize())
+		_, err = sysDB.pool.Exec(context.Background(), dq, workflowID)
+		require.NoError(t, err)
+	}
+
+	// 1. Normal struct input → WithPortableWorkflow → run, verify DB envelope, recover.
+	t.Run("NormalInputPortableMode", func(t *testing.T) {
+		workflowID := "direct-portable-normal-" + t.Name()
+		handle, err := RunWorkflow(executor, portableEchoWf, expectedInput,
+			WithWorkflowID(workflowID), WithPortableWorkflow())
+		require.NoError(t, err)
+
+		result, err := handle.GetResult()
+		require.NoError(t, err)
+		assert.Equal(t, expectedInput, result)
+
+		// Verify the DB has portable_json serialization with the correct envelope.
+		storedInputs, storedSerialization := readStoredInputs(t, workflowID)
+		assert.Equal(t, PortableSerializerName, storedSerialization)
+
+		var envelope portableArgsRaw
+		require.NoError(t, json.Unmarshal([]byte(storedInputs), &envelope))
+		assert.Len(t, envelope.PositionalArgs, 1, "expected 1 positional arg")
+		// The first positional arg should unmarshal to expectedInput.
+		var decoded InteropInput
+		require.NoError(t, json.Unmarshal(envelope.PositionalArgs[0], &decoded))
+		assert.Equal(t, expectedInput, decoded)
+
+		// Reset workflow to PENDING and recover — should re-execute and produce the same result.
+		resetToPending(t, workflowID)
+		handles, err := recoverPendingWorkflows(c, []string{"local"})
+		require.NoError(t, err)
+		require.Len(t, handles, 1)
+		_, err = handles[0].GetResult()
+		require.NoError(t, err)
+
+		retrieved, err := RetrieveWorkflow[InteropInput](executor, workflowID)
+		require.NoError(t, err)
+		recoveredResult, err := retrieved.GetResult()
+		require.NoError(t, err)
+		assert.Equal(t, expectedInput, recoveredResult)
+	})
+
+	// 2. PortableWorkflowArgs envelope input → WithPortableWorkflow → run, verify, recover.
+	t.Run("EnvelopeInputPortableMode", func(t *testing.T) {
+		workflowID := "direct-portable-envelope-" + t.Name()
+		envelopeInput := PortableWorkflowArgs{
+			PositionalArgs: []any{expectedInput, "extra", 42},
+			NamedArgs:      map[string]any{"lang": "go", "debug": false},
+		}
+		handle, err := RunWorkflow(executor, portableEnvelopeWf, envelopeInput,
+			WithWorkflowID(workflowID), WithPortableWorkflow())
+		require.NoError(t, err)
+
+		result, err := handle.GetResult()
+		require.NoError(t, err)
+		// The workflow receives and returns the full envelope.
+		assert.Len(t, result.PositionalArgs, 3)
+		assert.Len(t, result.NamedArgs, 2)
+
+		// Verify DB: the stored inputs should be the envelope itself (not double-wrapped).
+		storedInputs, storedSerialization := readStoredInputs(t, workflowID)
+		assert.Equal(t, PortableSerializerName, storedSerialization)
+
+		var storedEnvelope PortableWorkflowArgs
+		require.NoError(t, json.Unmarshal([]byte(storedInputs), &storedEnvelope))
+		assert.Len(t, storedEnvelope.PositionalArgs, 3, "envelope should not be double-wrapped")
+		assert.Len(t, storedEnvelope.NamedArgs, 2)
+
+		// Reset and recover.
+		resetToPending(t, workflowID)
+		handles, err := recoverPendingWorkflows(c, []string{"local"})
+		require.NoError(t, err)
+		require.Len(t, handles, 1)
+		_, err = handles[0].GetResult()
+		require.NoError(t, err)
+
+		retrieved, err := RetrieveWorkflow[PortableWorkflowArgs](executor, workflowID)
+		require.NoError(t, err)
+		recoveredResult, err := retrieved.GetResult()
+		require.NoError(t, err)
+		assert.Len(t, recoveredResult.PositionalArgs, 3)
+		assert.Len(t, recoveredResult.NamedArgs, 2)
+	})
+
+	// 3. Primitive int input → WithPortableWorkflow → run, verify DB envelope, recover.
+	t.Run("PrimitiveIntInputPortableMode", func(t *testing.T) {
+		workflowID := "direct-portable-int-" + t.Name()
+		handle, err := RunWorkflow(executor, portableIntEchoWf, 42,
+			WithWorkflowID(workflowID), WithPortableWorkflow())
+		require.NoError(t, err)
+
+		result, err := handle.GetResult()
+		require.NoError(t, err)
+		assert.Equal(t, 42, result)
+
+		// Verify DB envelope wraps the primitive as a single positional arg.
+		storedInputs, storedSerialization := readStoredInputs(t, workflowID)
+		assert.Equal(t, PortableSerializerName, storedSerialization)
+
+		var envelope portableArgsRaw
+		require.NoError(t, json.Unmarshal([]byte(storedInputs), &envelope))
+		assert.Len(t, envelope.PositionalArgs, 1, "expected 1 positional arg")
+		var decoded int
+		require.NoError(t, json.Unmarshal(envelope.PositionalArgs[0], &decoded))
+		assert.Equal(t, 42, decoded)
+
+		// Recover.
+		resetToPending(t, workflowID)
+		handles, err := recoverPendingWorkflows(c, []string{"local"})
+		require.NoError(t, err)
+		require.Len(t, handles, 1)
+		_, err = handles[0].GetResult()
+		require.NoError(t, err)
+
+		retrieved, err := RetrieveWorkflow[int](executor, workflowID)
+		require.NoError(t, err)
+		recoveredResult, err := retrieved.GetResult()
+		require.NoError(t, err)
+		assert.Equal(t, 42, recoveredResult)
+	})
+
+	// 4. Primitive string input → WithPortableWorkflow → run, verify DB envelope, recover.
+	t.Run("PrimitiveStringInputPortableMode", func(t *testing.T) {
+		workflowID := "direct-portable-str-" + t.Name()
+		handle, err := RunWorkflow(executor, portableStringEchoWf, "hello-portable",
+			WithWorkflowID(workflowID), WithPortableWorkflow())
+		require.NoError(t, err)
+
+		result, err := handle.GetResult()
+		require.NoError(t, err)
+		assert.Equal(t, "hello-portable", result)
+
+		// Verify DB envelope wraps the string as a single positional arg.
+		storedInputs, storedSerialization := readStoredInputs(t, workflowID)
+		assert.Equal(t, PortableSerializerName, storedSerialization)
+
+		var envelope portableArgsRaw
+		require.NoError(t, json.Unmarshal([]byte(storedInputs), &envelope))
+		assert.Len(t, envelope.PositionalArgs, 1, "expected 1 positional arg")
+		var decoded string
+		require.NoError(t, json.Unmarshal(envelope.PositionalArgs[0], &decoded))
+		assert.Equal(t, "hello-portable", decoded)
+
+		// Recover.
+		resetToPending(t, workflowID)
+		handles, err := recoverPendingWorkflows(c, []string{"local"})
+		require.NoError(t, err)
+		require.Len(t, handles, 1)
+		_, err = handles[0].GetResult()
+		require.NoError(t, err)
+
+		retrieved, err := RetrieveWorkflow[string](executor, workflowID)
+		require.NoError(t, err)
+		recoveredResult, err := retrieved.GetResult()
+		require.NoError(t, err)
+		assert.Equal(t, "hello-portable", recoveredResult)
+	})
+
+	// 5. Partial recovery: run a multi-step portable workflow, keep operation_outputs,
+	// reset to PENDING. On recovery every step is replayed from stored results using
+	// the serialization column in operation_outputs — NOT re-executed.
+	t.Run("PartialRecoveryFromStoredSteps", func(t *testing.T) {
+		workflowID := "partial-recovery-" + t.Name()
+		handle, err := RunWorkflow(executor, multiStepWf, expectedInput,
+			WithWorkflowID(workflowID), WithPortableWorkflow())
+		require.NoError(t, err)
+		firstResult, err := handle.GetResult()
+		require.NoError(t, err)
+		assert.Equal(t, expectedInput, firstResult.StepOut)
+		assert.Equal(t, expectedInput, firstResult.RecvOut)
+		assert.Equal(t, expectedInput, firstResult.EventOut)
+
+		// Verify operation_outputs exist for this workflow.
+		var stepCount int
+		countQ := fmt.Sprintf(`SELECT count(*) FROM %s.operation_outputs WHERE workflow_uuid = $1`,
+			pgx.Identifier{sysDB.schema}.Sanitize())
+		require.NoError(t, sysDB.pool.QueryRow(context.Background(), countQ, workflowID).Scan(&stepCount))
+		require.Greater(t, stepCount, 0, "expected operation_outputs rows from first execution")
+
+		// Reset to PENDING but KEEP operation_outputs — steps will be replayed from DB.
+		resetQ := fmt.Sprintf(`UPDATE %s.workflow_status SET status = $1, output = NULL, error = NULL WHERE workflow_uuid = $2`,
+			pgx.Identifier{sysDB.schema}.Sanitize())
+		_, err = sysDB.pool.Exec(context.Background(), resetQ, string(WorkflowStatusPending), workflowID)
+		require.NoError(t, err)
+
+		// Recover — each step hits checkOperationExecution and decodes from stored serialization.
+		handles, err := recoverPendingWorkflows(c, []string{"local"})
+		require.NoError(t, err)
+		require.Len(t, handles, 1)
+		_, err = handles[0].GetResult()
+		require.NoError(t, err)
+
+		retrieved, err := RetrieveWorkflow[PartialRecoveryResult](executor, workflowID)
+		require.NoError(t, err)
+		recoveredResult, err := retrieved.GetResult()
+		require.NoError(t, err)
+		assert.Equal(t, expectedInput, recoveredResult.StepOut, "step replayed from DB")
+		assert.Equal(t, expectedInput, recoveredResult.RecvOut, "recv replayed from DB")
+		assert.Equal(t, expectedInput, recoveredResult.EventOut, "getEvent replayed from DB")
+	})
+}
+
+func TestPortableWorkflowError(t *testing.T) {
+	executor := setupDBOS(t, setupDBOSOptions{dropDB: true, checkLeaks: true})
+
+	// Workflow that runs a step then raises a PortableWorkflowError with all fields set.
+	portableErrWf := func(ctx DBOSContext, input string) (string, error) {
+		_, err := RunAsStep(ctx, func(_ context.Context) (string, error) {
+			return input, nil
+		})
+		if err != nil {
+			return "", err
+		}
+		return "", &PortableWorkflowError{
+			Name:    "ValidationError",
+			Message: "invalid input: " + input,
+			Code:    400,
+			Data:    map[string]any{"field": "input"},
+		}
+	}
+	RegisterWorkflow(executor, portableErrWf, WithWorkflowName("portable_err_wf"))
+
+	// Workflow that runs a step that itself fails with a PortableWorkflowError.
+	portableStepErrWf := func(ctx DBOSContext, input string) (string, error) {
+		return RunAsStep(ctx, func(_ context.Context) (string, error) {
+			return "", &PortableWorkflowError{
+				Name:    "StepError",
+				Message: "step failed: " + input,
+				Code:    500,
+			}
+		})
+	}
+	RegisterWorkflow(executor, portableStepErrWf, WithWorkflowName("portable_step_err_wf"))
+
+	// Workflow that runs a step then raises a plain Go error (triggers best-effort conversion).
+	plainErrWf := func(ctx DBOSContext, input string) (string, error) {
+		_, err := RunAsStep(ctx, func(_ context.Context) (string, error) {
+			return input, nil
+		})
+		if err != nil {
+			return "", err
+		}
+		return "", fmt.Errorf("something went wrong: %s", input)
+	}
+	RegisterWorkflow(executor, plainErrWf, WithWorkflowName("plain_err_portable_wf"))
+
+	require.NoError(t, Launch(executor))
+	defer Shutdown(executor, 10*time.Second)
+
+	c := executor.(*dbosContext)
+	sysDB := c.systemDB.(*sysDB)
+
+	readStoredError := func(t *testing.T, workflowID string) string {
+		t.Helper()
+		var storedError *string
+		q := fmt.Sprintf(`SELECT error FROM %s.workflow_status WHERE workflow_uuid = $1`,
+			pgx.Identifier{sysDB.schema}.Sanitize())
+		require.NoError(t, sysDB.pool.QueryRow(context.Background(), q, workflowID).Scan(&storedError))
+		require.NotNil(t, storedError)
+		return *storedError
+	}
+
+	readStoredStepError := func(t *testing.T, workflowID string, stepID int) string {
+		t.Helper()
+		var storedError *string
+		q := fmt.Sprintf(`SELECT error FROM %s.operation_outputs WHERE workflow_uuid = $1 AND function_id = $2`,
+			pgx.Identifier{sysDB.schema}.Sanitize())
+		require.NoError(t, sysDB.pool.QueryRow(context.Background(), q, workflowID, stepID).Scan(&storedError))
+		require.NotNil(t, storedError)
+		return *storedError
+	}
+
+	t.Run("PortableWorkflowErrorFields", func(t *testing.T) {
+		wfID := "portable-err-fields"
+		handle, err := RunWorkflow(executor, portableErrWf, "test-value",
+			WithWorkflowID(wfID), WithPortableWorkflow())
+		require.NoError(t, err)
+		_, err = handle.GetResult()
+		require.Error(t, err)
+
+		// Direct handle returns the raw *PortableWorkflowError from the goroutine.
+		var pe *PortableWorkflowError
+		require.ErrorAs(t, err, &pe)
+		assert.Equal(t, "ValidationError", pe.Name)
+		assert.Equal(t, "invalid input: test-value", pe.Message)
+
+		// Stored in DB as portable JSON.
+		var errData map[string]any
+		require.NoError(t, json.Unmarshal([]byte(readStoredError(t, wfID)), &errData))
+		assert.Equal(t, "ValidationError", errData["name"])
+		assert.Equal(t, "invalid input: test-value", errData["message"])
+		assert.Equal(t, float64(400), errData["code"])
+
+		// RetrieveWorkflow goes through DB deserialization — returns *PortableWorkflowError.
+		retrieved, err := RetrieveWorkflow[string](executor, wfID)
+		require.NoError(t, err)
+		_, err = retrieved.GetResult()
+		require.Error(t, err)
+		var dbPe *PortableWorkflowError
+		require.ErrorAs(t, err, &dbPe)
+		assert.Equal(t, "ValidationError", dbPe.Name)
+		assert.Equal(t, "invalid input: test-value", dbPe.Message)
+		assert.Equal(t, float64(400), dbPe.Code) // JSON numbers unmarshal to float64
+		dbData, ok := dbPe.Data.(map[string]any)
+		require.True(t, ok)
+		assert.Equal(t, "input", dbData["field"])
+	})
+
+	t.Run("PlainErrorBestEffortConversion", func(t *testing.T) {
+		wfID := "portable-err-plain"
+		handle, err := RunWorkflow(executor, plainErrWf, "oops",
+			WithWorkflowID(wfID), WithPortableWorkflow())
+		require.NoError(t, err)
+		_, err = handle.GetResult()
+		require.Error(t, err)
+
+		// Stored in DB as portable JSON with best-effort name and message.
+		var errData map[string]any
+		require.NoError(t, json.Unmarshal([]byte(readStoredError(t, wfID)), &errData))
+		assert.Equal(t, "something went wrong: oops", errData["message"])
+		assert.Equal(t, "Portable Error", errData["name"])
+
+		// The stored JSON deserializes directly into *PortableWorkflowError.
+		var storedPe PortableWorkflowError
+		require.NoError(t, json.Unmarshal([]byte(readStoredError(t, wfID)), &storedPe))
+		assert.Equal(t, "something went wrong: oops", storedPe.Message)
+		assert.Equal(t, "Portable Error", storedPe.Name)
+
+		// RetrieveWorkflow deserializes the portable JSON back to *PortableWorkflowError.
+		retrieved, err := RetrieveWorkflow[string](executor, wfID)
+		require.NoError(t, err)
+		_, err = retrieved.GetResult()
+		require.Error(t, err)
+		var pe *PortableWorkflowError
+		require.ErrorAs(t, err, &pe)
+		assert.Equal(t, "something went wrong: oops", pe.Message)
+		assert.Equal(t, "Portable Error", pe.Name)
+	})
+
+	t.Run("StepPortableWorkflowError", func(t *testing.T) {
+		wfID := "portable-step-err"
+		handle, err := RunWorkflow(executor, portableStepErrWf, "step-input",
+			WithWorkflowID(wfID), WithPortableWorkflow())
+		require.NoError(t, err)
+		_, err = handle.GetResult()
+		require.Error(t, err)
+
+		// Step error stored as portable JSON in operation_outputs (step 0).
+		var stepErrData map[string]any
+		require.NoError(t, json.Unmarshal([]byte(readStoredStepError(t, wfID, 0)), &stepErrData))
+		assert.Equal(t, "StepError", stepErrData["name"])
+		assert.Equal(t, "step failed: step-input", stepErrData["message"])
+		assert.Equal(t, float64(500), stepErrData["code"])
+
+		// GetWorkflowSteps deserializes the step error as *PortableWorkflowError.
+		steps, err := GetWorkflowSteps(executor, wfID)
+		require.NoError(t, err)
+		require.Len(t, steps, 1)
+		var stepPe *PortableWorkflowError
+		require.ErrorAs(t, steps[0].Error, &stepPe)
+		assert.Equal(t, "StepError", stepPe.Name)
+		assert.Equal(t, "step failed: step-input", stepPe.Message)
+		assert.Equal(t, float64(500), stepPe.Code)
+	})
+
+	t.Run("ListWorkflowsAndGetWorkflowSteps", func(t *testing.T) {
+		wfID := "portable-list-wf"
+		handle, err := RunWorkflow(executor, portableErrWf, "list-test",
+			WithWorkflowID(wfID), WithPortableWorkflow())
+		require.NoError(t, err)
+		_, err = handle.GetResult()
+		require.Error(t, err)
+
+		// ListWorkflows: error goes through errors.New → .Error() → deserializeWorkflowError.
+		wfs, err := ListWorkflows(executor, WithWorkflowIDs([]string{wfID}))
+		require.NoError(t, err)
+		require.Len(t, wfs, 1)
+		var listPe *PortableWorkflowError
+		require.ErrorAs(t, wfs[0].Error, &listPe)
+		assert.Equal(t, "ValidationError", listPe.Name)
+		assert.Equal(t, "invalid input: list-test", listPe.Message)
+		assert.Equal(t, float64(400), listPe.Code)
+
+		// GetWorkflowSteps: first step succeeds (just echoes input), workflow error is separate.
+		steps, err := GetWorkflowSteps(executor, wfID)
+		require.NoError(t, err)
+		require.Len(t, steps, 1)
+		assert.Nil(t, steps[0].Error) // step succeeded; error is on the workflow, not the step
+		// Portable step output is returned as raw JSON string (not base64-decoded).
+		require.NotNil(t, steps[0].Output)
+		assert.Equal(t, `"list-test"`, steps[0].Output)
 	})
 }
