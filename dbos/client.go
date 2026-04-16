@@ -30,6 +30,7 @@ type Client interface {
 	GetEvent(targetWorkflowID, key string, timeout time.Duration) (any, error)
 	RetrieveWorkflow(workflowID string) (WorkflowHandle[any], error)
 	CancelWorkflow(workflowID string) error
+	SetWorkflowDelay(workflowID string, opts ...SetWorkflowDelayOption) error
 	DeleteWorkflows(workflowIDs []string, opts ...DeleteWorkflowOption) error
 	ResumeWorkflow(workflowID string) (WorkflowHandle[any], error)
 	ForkWorkflow(input ForkWorkflowInput) (WorkflowHandle[any], error)
@@ -144,6 +145,14 @@ func WithEnqueueConfigName(configName string) EnqueueOption {
 	}
 }
 
+// WithEnqueueDelay delays execution of the enqueued workflow by the specified duration.
+// The workflow starts in the DELAYED status and transitions to ENQUEUED after the delay expires.
+func WithEnqueueDelay(delay time.Duration) EnqueueOption {
+	return func(opts *enqueueOptions) {
+		opts.delayDuration = delay
+	}
+}
+
 type enqueueOptions struct {
 	workflowName       string
 	workflowID         string
@@ -155,6 +164,7 @@ type enqueueOptions struct {
 	queuePartitionKey  string
 	className          string
 	configName         *string
+	delayDuration      time.Duration
 }
 
 // EnqueueWorkflow enqueues a workflow to a named queue for deferred execution.
@@ -223,10 +233,19 @@ func (c *client) Enqueue(queueName, workflowName string, input any, opts ...Enqu
 		serialization = ser.Name()
 	}
 
+	var wfStatus WorkflowStatusType
+	var delayUntil time.Time
+	if params.delayDuration > 0 {
+		wfStatus = WorkflowStatusDelayed
+		delayUntil = time.Now().Add(params.delayDuration)
+	} else {
+		wfStatus = WorkflowStatusEnqueued
+	}
+
 	status := WorkflowStatus{
 		Name:               params.workflowName,
 		ApplicationVersion: params.applicationVersion,
-		Status:             WorkflowStatusEnqueued,
+		Status:             wfStatus,
 		ID:                 workflowID,
 		CreatedAt:          time.Now(),
 		Deadline:           deadline,
@@ -239,6 +258,7 @@ func (c *client) Enqueue(queueName, workflowName string, input any, opts ...Enqu
 		ClassName:          params.className,
 		ConfigName:         params.configName,
 		Serialization:      serialization,
+		DelayUntil:         delayUntil,
 	}
 
 	uncancellableCtx := WithoutCancel(dbosCtx)
@@ -371,6 +391,11 @@ func (c *client) RetrieveWorkflow(workflowID string) (WorkflowHandle[any], error
 // CancelWorkflow cancels a running or enqueued workflow.
 func (c *client) CancelWorkflow(workflowID string) error {
 	return c.dbosCtx.CancelWorkflow(c.dbosCtx, workflowID)
+}
+
+// SetWorkflowDelay sets or updates the delay on a DELAYED workflow.
+func (c *client) SetWorkflowDelay(workflowID string, opts ...SetWorkflowDelayOption) error {
+	return c.dbosCtx.SetWorkflowDelay(c.dbosCtx, workflowID, opts...)
 }
 
 // DeleteWorkflows permanently deletes workflows and all their associated data.
