@@ -29,19 +29,20 @@ const (
 // Config holds configuration parameters for initializing a DBOS context.
 // DatabaseURL and AppName are required.
 type Config struct {
-	AppName            string          // Application name for identification (required)
-	DatabaseURL        string          // DatabaseURL is a PostgreSQL connection string. Either this or SystemDBPool is required.
-	SystemDBPool       *pgxpool.Pool   // SystemDBPool is a custom System Database Pool. It's optional and takes precedence over DatabaseURL if both are provided.
-	DatabaseSchema     string          // Database schema name (defaults to "dbos")
-	Logger             *slog.Logger    // Custom logger instance (defaults to a new slog logger)
-	AdminServer        bool            // Enable Transact admin HTTP server (disabled by default)
-	AdminServerPort    int             // Port for the admin HTTP server (default: 3001)
-	ConductorURL       string          // DBOS conductor service URL (optional)
-	ConductorAPIKey    string          // DBOS conductor API key (optional)
-	ApplicationVersion string          // Application version (optional, overridden by DBOS__APPVERSION env var)
-	ExecutorID         string          // Executor ID (optional, overridden by DBOS__VMID env var)
-	EnablePatching     bool            // Enable the patching system for Patch and DeprecatePatch (default: false)
-	Serializer         Serializer[any] // Custom serializer for encoding/decoding workflow inputs, outputs, and events (defaults to JSON serializer)
+	AppName                  string          // Application name for identification (required)
+	DatabaseURL              string          // DatabaseURL is a PostgreSQL connection string. Either this or SystemDBPool is required.
+	SystemDBPool             *pgxpool.Pool   // SystemDBPool is a custom System Database Pool. It's optional and takes precedence over DatabaseURL if both are provided.
+	DatabaseSchema           string          // Database schema name (defaults to "dbos")
+	Logger                   *slog.Logger    // Custom logger instance (defaults to a new slog logger)
+	AdminServer              bool            // Enable Transact admin HTTP server (disabled by default)
+	AdminServerPort          int             // Port for the admin HTTP server (default: 3001)
+	ConductorURL             string          // DBOS conductor service URL (optional)
+	ConductorAPIKey          string          // DBOS conductor API key (optional)
+	ApplicationVersion       string          // Application version (optional, overridden by DBOS__APPVERSION env var)
+	ExecutorID               string          // Executor ID (optional, overridden by DBOS__VMID env var)
+	EnablePatching           bool            // Enable the patching system for Patch and DeprecatePatch (default: false)
+	Serializer               Serializer[any] // Custom serializer for encoding/decoding workflow inputs, outputs, and events (defaults to JSON serializer)
+	SchedulerPollingInterval time.Duration   // controls how often dynamic schedules are reconciled with the database (defaults to 30 seconds)
 }
 
 func processConfig(inputConfig *Config) (*Config, error) {
@@ -57,19 +58,20 @@ func processConfig(inputConfig *Config) (*Config, error) {
 	}
 
 	dbosConfig := &Config{
-		DatabaseURL:        inputConfig.DatabaseURL,
-		AppName:            inputConfig.AppName,
-		DatabaseSchema:     inputConfig.DatabaseSchema,
-		Logger:             inputConfig.Logger,
-		AdminServer:        inputConfig.AdminServer,
-		AdminServerPort:    inputConfig.AdminServerPort,
-		ConductorURL:       inputConfig.ConductorURL,
-		ConductorAPIKey:    inputConfig.ConductorAPIKey,
-		ApplicationVersion: inputConfig.ApplicationVersion,
-		ExecutorID:         inputConfig.ExecutorID,
-		SystemDBPool:       inputConfig.SystemDBPool,
-		EnablePatching:     inputConfig.EnablePatching,
-		Serializer:         inputConfig.Serializer,
+		DatabaseURL:              inputConfig.DatabaseURL,
+		AppName:                  inputConfig.AppName,
+		DatabaseSchema:           inputConfig.DatabaseSchema,
+		Logger:                   inputConfig.Logger,
+		AdminServer:              inputConfig.AdminServer,
+		AdminServerPort:          inputConfig.AdminServerPort,
+		ConductorURL:             inputConfig.ConductorURL,
+		ConductorAPIKey:          inputConfig.ConductorAPIKey,
+		ApplicationVersion:       inputConfig.ApplicationVersion,
+		ExecutorID:               inputConfig.ExecutorID,
+		SystemDBPool:             inputConfig.SystemDBPool,
+		EnablePatching:           inputConfig.EnablePatching,
+		Serializer:               inputConfig.Serializer,
+		SchedulerPollingInterval: inputConfig.SchedulerPollingInterval,
 	}
 
 	// Load defaults
@@ -140,17 +142,17 @@ type DBOSContext interface {
 	GetStepID() (int, error)                                                                                    // Get the current step ID (only available within workflows)
 
 	// Workflow management
-	RetrieveWorkflow(_ DBOSContext, workflowID string) (WorkflowHandle[any], error)                                // Get a handle to an existing workflow
-	CancelWorkflow(_ DBOSContext, workflowID string) error                                                         // Cancel a workflow by setting its status to CANCELLED
-	SetWorkflowDelay(_ DBOSContext, workflowID string, opts ...SetWorkflowDelayOption) error                       // Set or update the delay on a DELAYED workflow
-	ResumeWorkflow(_ DBOSContext, workflowID string, opts ...ResumeWorkflowOption) (WorkflowHandle[any], error)    // Resume a cancelled workflow
+	RetrieveWorkflow(_ DBOSContext, workflowID string) (WorkflowHandle[any], error)                                   // Get a handle to an existing workflow
+	CancelWorkflow(_ DBOSContext, workflowID string) error                                                            // Cancel a workflow by setting its status to CANCELLED
+	SetWorkflowDelay(_ DBOSContext, workflowID string, opts ...SetWorkflowDelayOption) error                          // Set or update the delay on a DELAYED workflow
+	ResumeWorkflow(_ DBOSContext, workflowID string, opts ...ResumeWorkflowOption) (WorkflowHandle[any], error)       // Resume a cancelled workflow
 	ResumeWorkflows(_ DBOSContext, workflowIDs []string, opts ...ResumeWorkflowOption) ([]WorkflowHandle[any], error) // Resume multiple workflows in a single DB round-trip
-	ForkWorkflow(_ DBOSContext, input ForkWorkflowInput) (WorkflowHandle[any], error)                              // Fork a workflow from a specific step
-	ListWorkflows(_ DBOSContext, opts ...ListWorkflowsOption) ([]WorkflowStatus, error)                            // List workflows based on filtering criteria
-	GetWorkflowSteps(_ DBOSContext, workflowID string) ([]StepInfo, error)                                         // Get the execution steps of a workflow
-	ListRegisteredWorkflows(_ DBOSContext, opts ...ListRegisteredWorkflowsOption) ([]WorkflowRegistryEntry, error) // List registered workflows with filtering options
-	ListRegisteredQueues(_ DBOSContext) ([]WorkflowQueue, error)                                                   // List all registered workflow queues
-	DeleteWorkflows(_ DBOSContext, workflowIDs []string, opts ...DeleteWorkflowOption) error                       // Delete workflows and all their associated data
+	ForkWorkflow(_ DBOSContext, input ForkWorkflowInput) (WorkflowHandle[any], error)                                 // Fork a workflow from a specific step
+	ListWorkflows(_ DBOSContext, opts ...ListWorkflowsOption) ([]WorkflowStatus, error)                               // List workflows based on filtering criteria
+	GetWorkflowSteps(_ DBOSContext, workflowID string) ([]StepInfo, error)                                            // Get the execution steps of a workflow
+	ListRegisteredWorkflows(_ DBOSContext, opts ...ListRegisteredWorkflowsOption) ([]WorkflowRegistryEntry, error)    // List registered workflows with filtering options
+	ListRegisteredQueues(_ DBOSContext) ([]WorkflowQueue, error)                                                      // List all registered workflow queues
+	DeleteWorkflows(_ DBOSContext, workflowIDs []string, opts ...DeleteWorkflowOption) error                          // Delete workflows and all their associated data
 
 	// Accessors
 	GetApplicationVersion() string // Get the application version for this context
@@ -166,6 +168,17 @@ type DBOSContext interface {
 
 	// Queue configuration
 	ListenQueues(_ DBOSContext, queues ...WorkflowQueue) // Configure which queues this process should listen to
+
+	// Schedule management
+	CreateSchedule(_ DBOSContext, fn ScheduledWorkflowFunc, input CreateScheduleRequest, opts ...CreateScheduleOption) error // Create a new schedule
+	ApplySchedules(_ DBOSContext, schedules []ApplySchedulesRequest) error                                                   // Apply schedules (create or update)
+	PauseSchedule(_ DBOSContext, scheduleName string) error                                                                  // Pause a schedule
+	ResumeSchedule(_ DBOSContext, scheduleName string) error                                                                 // Resume a paused schedule
+	DeleteSchedule(_ DBOSContext, scheduleName string) error                                                                 // Delete a schedule
+	GetSchedule(_ DBOSContext, scheduleName string) (*WorkflowSchedule, error)                                               // Get a schedule by name
+	ListSchedules(_ DBOSContext, opts ...ListSchedulesOption) ([]WorkflowSchedule, error)                                    // List schedules with optional filters
+	BackfillSchedule(_ DBOSContext, scheduleName string, start time.Time, end time.Time) ([]string, error)                   // Backfill a schedule, returning the IDs of the enqueued workflows
+	TriggerSchedule(_ DBOSContext, scheduleName string) (WorkflowHandle[any], error)                                         // Trigger a schedule immediately, returning a handle to the enqueued workflow
 
 	// Alert handling
 	SetAlertHandler(handler AlertHandler) // Register a handler for alerts from DBOS Conductor (must be called before Launch)
@@ -204,6 +217,13 @@ type dbosContext struct {
 
 	// Workflow scheduler
 	workflowScheduler *cron.Cron
+
+	scheduleMu sync.Mutex
+	// Schedule entry ID mapping (scheduleName -> cron.EntryID)
+	scheduleEntryIDs map[string]cron.EntryID
+	// ScheduleID of the schedule currently backing each installed cron entry.
+	// Used by the reconciler to detect re-applies and reinstall the entry.
+	scheduleInstalledIDs map[string]string
 
 	// logger
 	logger *slog.Logger
@@ -424,6 +444,8 @@ func WithTimeout(ctx DBOSContext, timeout time.Duration) (DBOSContext, context.C
 func (c *dbosContext) getWorkflowScheduler() *cron.Cron {
 	if c.workflowScheduler == nil {
 		c.workflowScheduler = cron.New(cron.WithSeconds())
+		c.scheduleEntryIDs = make(map[string]cron.EntryID)
+		c.scheduleInstalledIDs = make(map[string]string)
 	}
 	return c.workflowScheduler
 }
@@ -606,11 +628,13 @@ func (c *dbosContext) Launch() error {
 	}()
 	c.logger.Debug("Queue runner started")
 
-	// Start the workflow scheduler if it has been initialized
-	if c.workflowScheduler != nil {
-		c.workflowScheduler.Start()
-		c.logger.Debug("Workflow scheduler started")
-	}
+	// Start the cron scheduler.
+	c.getWorkflowScheduler().Start()
+	c.logger.Debug("Workflow scheduler started")
+
+	// Start the dynamic schedule reconciler. It polls the schedules table every
+	// _SCHEDULE_POLL_INTERVAL and reconciles cron entries against DB state.
+	go c.runScheduleReconciler()
 
 	// Start the conductor if it has been initialized
 	if c.conductor != nil {
@@ -655,19 +679,9 @@ func (c *dbosContext) Shutdown(timeout time.Duration) {
 	// Cancel the context to signal all resources to stop
 	c.ctxCancelFunc(errors.New("DBOS cancellation initiated"))
 
-	// Wait for all workflows to finish
-	c.logger.Debug("Waiting for all workflows to finish")
-	done := make(chan struct{})
-	go func() {
-		c.workflowsWg.Wait()
-		close(done)
-	}()
-	select {
-	case <-done:
-		c.logger.Debug("All workflows completed")
-	case <-time.After(timeout):
-		c.logger.Warn("Timeout waiting for workflows to complete", "timeout", timeout)
-	}
+	// Stop workflow producers before draining in-flight workflows. Producers
+	// (.e.g, queue runner) call RunWorkflow, which calls workflowsWg.Add(1);
+	// waiting on the WaitGroup before they finish races with those Adds.
 
 	// Wait for queue runner to finish
 	if c.queueRunner != nil && c.launched.Load() {
@@ -709,6 +723,20 @@ func (c *dbosContext) Shutdown(timeout time.Duration) {
 		} else {
 			c.logger.Debug("Admin server shutdown complete")
 		}
+	}
+
+	// Now that all producers are stopped, wait for in-flight workflows to finish
+	c.logger.Debug("Waiting for all workflows to finish")
+	done := make(chan struct{})
+	go func() {
+		c.workflowsWg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		c.logger.Debug("All workflows completed")
+	case <-time.After(timeout):
+		c.logger.Warn("Timeout waiting for workflows to complete", "timeout", timeout)
 	}
 
 	// Close the system database

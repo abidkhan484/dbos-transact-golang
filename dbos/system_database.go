@@ -85,6 +85,15 @@ type systemDatabase interface {
 	// Metrics
 	getMetrics(ctx context.Context, startTime string, endTime string) ([]metricData, error)
 
+	// Schedules
+	createSchedule(ctx context.Context, input createScheduleDBInput) error
+	listSchedules(ctx context.Context, input listSchedulesDBInput) ([]WorkflowSchedule, error)
+	updateSchedule(ctx context.Context, input updateScheduleDBInput) error
+	updateScheduleLastFiredAt(ctx context.Context, scheduleName string, lastFiredAt time.Time) error
+	deleteSchedule(ctx context.Context, input deleteScheduleDBInput) error
+	backfillSchedule(ctx context.Context, input backfillScheduleDBInput) ([]string, error)
+	triggerSchedule(ctx context.Context, scheduleName string) (string, error)
+
 	// Workflow export/import
 	exportWorkflow(ctx context.Context, workflowID string, exportChildren bool) ([]ExportedWorkflow, error)
 	importWorkflow(ctx context.Context, workflows []ExportedWorkflow) error
@@ -205,6 +214,9 @@ var migration15SQL string
 //go:embed migrations/16_add_delay_until.sql
 var migration16SQL string
 
+//go:embed migrations/17_add_workflow_schedule_queue_name.sql
+var migration17SQL string
+
 type migrationFile struct {
 	version int64
 	sql     string
@@ -278,6 +290,8 @@ func runMigrations(ctx context.Context, pool *pgxpool.Pool, schema string, isCoc
 
 	migration16SQLProcessed := fmt.Sprintf(migration16SQL, sanitizedSchema, sanitizedSchema)
 
+	migration17SQLProcessed := fmt.Sprintf(migration17SQL, sanitizedSchema)
+
 	// Build migrations list with processed SQL
 	migrations := []migrationFile{
 		{version: 1, sql: migration1SQLProcessed},
@@ -296,6 +310,7 @@ func runMigrations(ctx context.Context, pool *pgxpool.Pool, schema string, isCoc
 		{version: 14, sql: migration14SQLProcessed},
 		{version: 15, sql: migration15SQLProcessed},
 		{version: 16, sql: migration16SQLProcessed},
+		{version: 17, sql: migration17SQLProcessed},
 	}
 
 	// Begin transaction for atomic migration execution
@@ -1500,8 +1515,9 @@ func (s *sysDB) forkWorkflow(ctx context.Context, input forkWorkflowDBInput) (st
 		created_at,
 		updated_at,
 		recovery_attempts,
-		forked_from
-	) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)`, pgx.Identifier{s.schema}.Sanitize())
+		forked_from,
+		serialization
+	) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)`, pgx.Identifier{s.schema}.Sanitize())
 
 	// Marshal authenticated roles (slice of strings) to JSON for TEXT column
 	authenticatedRoles, err := json.Marshal(originalWorkflow.AuthenticatedRoles)
@@ -1523,7 +1539,8 @@ func (s *sysDB) forkWorkflow(ctx context.Context, input forkWorkflowDBInput) (st
 		time.Now().UnixMilli(),
 		time.Now().UnixMilli(),
 		0,
-		input.originalWorkflowID) // forked_from
+		input.originalWorkflowID,       // forked_from
+		originalWorkflow.Serialization) // serialization
 
 	if err != nil {
 		return "", fmt.Errorf("failed to insert forked workflow status: %w", err)
@@ -3350,6 +3367,408 @@ func (s *sysDB) getMetricStepCount(ctx context.Context, startEpochMs, endEpochMs
 }
 
 /*******************************/
+/******* SCHEDULES ********/
+/*******************************/
+
+type createScheduleDBInput struct {
+	ScheduleID        string
+	ScheduleName      string
+	WorkflowName      string
+	WorkflowClassName string
+	Schedule          string
+	Context           string // JSON serialized
+	Status            ScheduleStatus
+	AutomaticBackfill bool
+	CronTimezone      string
+	QueueName         string
+	tx                pgx.Tx // optional: run inside an existing transaction
+}
+
+func (s *sysDB) createSchedule(ctx context.Context, input createScheduleDBInput) error {
+	query := fmt.Sprintf(`
+		INSERT INTO %s.workflow_schedules (
+			schedule_id, schedule_name, workflow_name, workflow_class_name,
+			schedule, context, status, automatic_backfill, cron_timezone, queue_name
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+	`, pgx.Identifier{s.schema}.Sanitize())
+
+	var queueNameVal any
+	if input.QueueName != "" {
+		queueNameVal = input.QueueName
+	}
+
+	var workflowClassNameVal any
+	if input.WorkflowClassName != "" {
+		workflowClassNameVal = input.WorkflowClassName
+	}
+
+	args := []any{
+		input.ScheduleID,
+		input.ScheduleName,
+		input.WorkflowName,
+		workflowClassNameVal,
+		input.Schedule,
+		input.Context,
+		input.Status,
+		input.AutomaticBackfill,
+		input.CronTimezone,
+		queueNameVal,
+	}
+
+	var err error
+	if input.tx != nil {
+		_, err = input.tx.Exec(ctx, query, args...)
+	} else {
+		_, err = s.pool.Exec(ctx, query, args...)
+	}
+	if err != nil {
+		return fmt.Errorf("failed to create schedule: %w", err)
+	}
+	return nil
+}
+
+type listSchedulesDBInput struct {
+	Statuses             []ScheduleStatus
+	WorkflowNames        []string
+	ScheduleNamePrefixes []string
+	tx                   pgx.Tx // optional: run inside an existing transaction
+}
+
+func (s *sysDB) listSchedules(ctx context.Context, input listSchedulesDBInput) ([]WorkflowSchedule, error) {
+	query := fmt.Sprintf(`
+		SELECT schedule_id, schedule_name, workflow_name, workflow_class_name,
+		       schedule, status, context, last_fired_at, automatic_backfill,
+		       cron_timezone, queue_name
+		FROM %s.workflow_schedules
+	`, pgx.Identifier{s.schema}.Sanitize())
+
+	var args []any
+	var conds []string
+	placeholder := func(v any) string {
+		args = append(args, v)
+		return fmt.Sprintf("$%d", len(args))
+	}
+
+	if len(input.Statuses) > 0 {
+		statuses := make([]string, len(input.Statuses))
+		for i, st := range input.Statuses {
+			statuses[i] = string(st)
+		}
+		conds = append(conds, "status = ANY("+placeholder(statuses)+")")
+	}
+	if len(input.WorkflowNames) > 0 {
+		conds = append(conds, "workflow_name = ANY("+placeholder(input.WorkflowNames)+")")
+	}
+	if len(input.ScheduleNamePrefixes) > 0 {
+		parts := make([]string, len(input.ScheduleNamePrefixes))
+		for i, p := range input.ScheduleNamePrefixes {
+			parts[i] = "schedule_name LIKE " + placeholder(p+"%")
+		}
+		conds = append(conds, "("+strings.Join(parts, " OR ")+")")
+	}
+	if len(conds) > 0 {
+		query += " WHERE " + strings.Join(conds, " AND ")
+	}
+
+	var rows pgx.Rows
+	var err error
+	if input.tx != nil {
+		rows, err = input.tx.Query(ctx, query, args...)
+	} else {
+		rows, err = s.pool.Query(ctx, query, args...)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("failed to list schedules: %w", err)
+	}
+	defer rows.Close()
+
+	var schedules []WorkflowSchedule
+	for rows.Next() {
+		var schedule WorkflowSchedule
+		var lastFiredAtStr *string
+		var contextJSON string
+
+		var queueName *string
+		var workflowClassName *string
+		err := rows.Scan(
+			&schedule.ScheduleID,
+			&schedule.ScheduleName,
+			&schedule.WorkflowName,
+			&workflowClassName,
+			&schedule.Schedule,
+			&schedule.Status,
+			&contextJSON,
+			&lastFiredAtStr,
+			&schedule.AutomaticBackfill,
+			&schedule.CronTimezone,
+			&queueName,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("failed to scan schedule: %w", err)
+		}
+		if queueName != nil {
+			schedule.QueueName = *queueName
+		} else {
+			schedule.QueueName = _DBOS_INTERNAL_QUEUE_NAME
+		}
+		if workflowClassName != nil {
+			schedule.WorkflowClassName = *workflowClassName
+		}
+
+		if lastFiredAtStr != nil {
+			t, err := time.Parse(time.RFC3339Nano, *lastFiredAtStr)
+			if err == nil {
+				schedule.LastFiredAt = &t
+			} else {
+				t, err = time.Parse(time.RFC3339, *lastFiredAtStr)
+				if err == nil {
+					schedule.LastFiredAt = &t
+				}
+			}
+		}
+		if err := json.Unmarshal([]byte(contextJSON), &schedule.Context); err != nil {
+			schedule.Context = contextJSON
+		}
+
+		schedules = append(schedules, schedule)
+	}
+
+	return schedules, nil
+}
+
+type updateScheduleDBInput struct {
+	ScheduleName string
+	Status       ScheduleStatus
+	LastFiredAt  *time.Time
+	tx           pgx.Tx // optional: run inside an existing transaction
+}
+
+func (s *sysDB) updateSchedule(ctx context.Context, input updateScheduleDBInput) error {
+	query := fmt.Sprintf(`
+		UPDATE %s.workflow_schedules
+		SET status = $1, last_fired_at = $2
+		WHERE schedule_name = $3
+	`, pgx.Identifier{s.schema}.Sanitize())
+
+	var lastFiredAtVal any
+	if input.LastFiredAt != nil {
+		lastFiredAtVal = input.LastFiredAt.Format(time.RFC3339Nano)
+	}
+
+	var err error
+	if input.tx != nil {
+		_, err = input.tx.Exec(ctx, query, input.Status, lastFiredAtVal, input.ScheduleName)
+	} else {
+		_, err = s.pool.Exec(ctx, query, input.Status, lastFiredAtVal, input.ScheduleName)
+	}
+	if err != nil {
+		return fmt.Errorf("failed to update schedule: %w", err)
+	}
+	return nil
+}
+
+func (s *sysDB) updateScheduleLastFiredAt(ctx context.Context, scheduleName string, lastFiredAt time.Time) error {
+	query := fmt.Sprintf(`
+		UPDATE %s.workflow_schedules
+		SET last_fired_at = $1
+		WHERE schedule_name = $2
+	`, pgx.Identifier{s.schema}.Sanitize())
+	_, err := s.pool.Exec(ctx, query, lastFiredAt.Format(time.RFC3339Nano), scheduleName)
+	if err != nil {
+		return fmt.Errorf("failed to update schedule last_fired_at: %w", err)
+	}
+	return nil
+}
+
+type deleteScheduleDBInput struct {
+	ScheduleName string
+	tx           pgx.Tx // optional: run inside an existing transaction
+}
+
+func (s *sysDB) deleteSchedule(ctx context.Context, input deleteScheduleDBInput) error {
+	query := fmt.Sprintf(`DELETE FROM %s.workflow_schedules WHERE schedule_name = $1`, pgx.Identifier{s.schema}.Sanitize())
+
+	var err error
+	if input.tx != nil {
+		_, err = input.tx.Exec(ctx, query, input.ScheduleName)
+	} else {
+		_, err = s.pool.Exec(ctx, query, input.ScheduleName)
+	}
+	if err != nil {
+		return fmt.Errorf("failed to delete schedule: %w", err)
+	}
+	return nil
+}
+
+type backfillScheduleDBInput struct {
+	ScheduleName string
+	Schedule     string
+	StartTime    time.Time
+	EndTime      time.Time
+}
+
+func (s *sysDB) backfillSchedule(ctx context.Context, input backfillScheduleDBInput) ([]string, error) {
+	schedules, err := s.listSchedules(ctx, listSchedulesDBInput{ScheduleNamePrefixes: []string{input.ScheduleName}})
+	if err != nil {
+		return nil, fmt.Errorf("failed to get schedule: %w", err)
+	}
+	var schedule *WorkflowSchedule
+	for i := range schedules {
+		if schedules[i].ScheduleName == input.ScheduleName {
+			schedule = &schedules[i]
+			break
+		}
+	}
+	if schedule == nil {
+		return nil, fmt.Errorf("schedule not found: %s", input.ScheduleName)
+	}
+
+	spec := input.Schedule
+	if schedule.CronTimezone != "" {
+		spec = "CRON_TZ=" + schedule.CronTimezone + " " + spec
+	}
+
+	scheduleEntry, err := newScheduleCronParser().Parse(spec)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse cron schedule: %w", err)
+	}
+
+	queueName := _DBOS_INTERNAL_QUEUE_NAME
+	if schedule.QueueName != "" {
+		queueName = schedule.QueueName
+	}
+
+	ser := resolveEncoder(ctx)
+
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	checkQuery := fmt.Sprintf(`SELECT 1 FROM %s.workflow_status WHERE workflow_uuid = $1 LIMIT 1`, pgx.Identifier{s.schema}.Sanitize())
+
+	nextTime := scheduleEntry.Next(input.StartTime)
+	now := time.Now()
+	var workflowIDs []string
+
+	for nextTime.Before(input.EndTime) {
+		workflowID := fmt.Sprintf("sched-%s-%s", input.ScheduleName, nextTime.Format(time.RFC3339))
+		workflowIDs = append(workflowIDs, workflowID)
+
+		var dummy int
+		err := tx.QueryRow(ctx, checkQuery, workflowID).Scan(&dummy)
+		if err == nil {
+			nextTime = scheduleEntry.Next(nextTime)
+			continue
+		}
+		if err != pgx.ErrNoRows {
+			return nil, fmt.Errorf("failed to check workflow existence for %s: %w", workflowID, err)
+		}
+
+		encodedInput, encErr := ser.Encode(ScheduledWorkflowInput{
+			ScheduledTime: nextTime,
+			Context:       schedule.Context,
+		})
+		if encErr != nil {
+			return nil, fmt.Errorf("failed to encode scheduled workflow input for %s: %w", workflowID, encErr)
+		}
+
+		status := WorkflowStatus{
+			ID:            workflowID,
+			Status:        WorkflowStatusEnqueued,
+			Name:          schedule.WorkflowName,
+			ClassName:     schedule.WorkflowClassName,
+			QueueName:     queueName,
+			CreatedAt:     now,
+			Input:         encodedInput,
+			Serialization: ser.Name(),
+		}
+		if _, err := s.insertWorkflowStatus(ctx, insertWorkflowStatusDBInput{status: status, tx: tx}); err != nil {
+			return nil, fmt.Errorf("failed to enqueue backfill workflow %s: %w", workflowID, err)
+		}
+
+		nextTime = scheduleEntry.Next(nextTime)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("failed to commit backfill transaction: %w", err)
+	}
+	return workflowIDs, nil
+}
+
+// triggerSchedule immediately enqueues the named schedule's workflow at the
+// current time, using the schedule's queue (or the internal queue by default)
+// and preserving its workflow_class_name and context. Returns the workflow ID.
+func (s *sysDB) triggerSchedule(ctx context.Context, scheduleName string) (string, error) {
+	if scheduleName == "" {
+		return "", errors.New("schedule_name is required")
+	}
+
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return "", fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	schedules, err := s.listSchedules(ctx, listSchedulesDBInput{
+		ScheduleNamePrefixes: []string{scheduleName},
+		tx:                   tx,
+	})
+	if err != nil {
+		return "", fmt.Errorf("failed to get schedule: %w", err)
+	}
+	var schedule *WorkflowSchedule
+	for i := range schedules {
+		if schedules[i].ScheduleName == scheduleName {
+			schedule = &schedules[i]
+			break
+		}
+	}
+	if schedule == nil {
+		return "", fmt.Errorf("schedule not found: %s", scheduleName)
+	}
+
+	queueName := schedule.QueueName
+	if queueName == "" {
+		queueName = _DBOS_INTERNAL_QUEUE_NAME
+	}
+
+	now := time.Now()
+	workflowID := fmt.Sprintf("sched-%s-trigger-%s", scheduleName, now.Format(time.RFC3339Nano))
+
+	ser := resolveEncoder(ctx)
+	encodedInput, err := ser.Encode(ScheduledWorkflowInput{
+		ScheduledTime: now,
+		Context:       schedule.Context,
+	})
+	if err != nil {
+		return "", fmt.Errorf("failed to encode scheduled workflow input: %w", err)
+	}
+
+	status := WorkflowStatus{
+		ID:            workflowID,
+		Status:        WorkflowStatusEnqueued,
+		Name:          schedule.WorkflowName,
+		ClassName:     schedule.WorkflowClassName,
+		QueueName:     queueName,
+		CreatedAt:     now,
+		Input:         encodedInput,
+		Serialization: ser.Name(),
+	}
+
+	if _, err := s.insertWorkflowStatus(ctx, insertWorkflowStatusDBInput{status: status, tx: tx}); err != nil {
+		return "", fmt.Errorf("failed to enqueue triggered workflow: %w", err)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return "", fmt.Errorf("failed to commit transaction: %w", err)
+	}
+
+	return workflowID, nil
+}
+
+/*******************************/
 /******* UTILS ********/
 /*******************************/
 
@@ -3788,7 +4207,7 @@ func (s *sysDB) exportWorkflow(ctx context.Context, workflowID string, exportChi
 				output, error, executor_id, created_at, updated_at, application_version, application_id,
 				class_name, config_name, recovery_attempts, queue_name, workflow_timeout_ms,
 				workflow_deadline_epoch_ms, started_at_epoch_ms, deduplication_id, inputs, priority,
-				queue_partition_key, forked_from, parent_workflow_id, delay_until_epoch_ms
+				queue_partition_key, forked_from, parent_workflow_id, delay_until_epoch_ms, serialization
 			FROM %s.workflow_status WHERE workflow_uuid = $1`, pgx.Identifier{s.schema}.Sanitize())
 
 		row := tx.QueryRow(ctx, statusQuery, wfID)
@@ -3802,13 +4221,14 @@ func (s *sysDB) exportWorkflow(ctx context.Context, workflowID string, exportChi
 			workflowTimeoutMs, workflowDeadlineEpochMs, startedAtEpochMs *int64
 			priority                                                     *int
 			delayUntilEpochMs                                            *int64
+			serialization                                                *string
 		)
 		err := row.Scan(
 			&wfUUID, &status, &name, &authUser, &assumedRole, &authRoles,
 			&output, &errStr, &executorID, &createdAt, &updatedAt, &appVersion, &appID,
 			&className, &configName, &recoveryAttempts, &queueName, &workflowTimeoutMs,
 			&workflowDeadlineEpochMs, &startedAtEpochMs, &dedupID, &inputs, &priority,
-			&queuePartitionKey, &forkedFrom, &parentWorkflowID, &delayUntilEpochMs,
+			&queuePartitionKey, &forkedFrom, &parentWorkflowID, &delayUntilEpochMs, &serialization,
 		)
 		if err != nil {
 			if err == pgx.ErrNoRows {
@@ -3845,6 +4265,7 @@ func (s *sysDB) exportWorkflow(ctx context.Context, workflowID string, exportChi
 			"forked_from":                forkedFrom,
 			"parent_workflow_id":         parentWorkflowID,
 			"delay_until_epoch_ms":       delayUntilEpochMs,
+			"serialization":              serialization,
 		}
 
 		// Export operation_outputs
@@ -3996,8 +4417,8 @@ func (s *sysDB) importWorkflow(ctx context.Context, workflows []ExportedWorkflow
 				output, error, executor_id, created_at, updated_at, application_version, application_id,
 				class_name, config_name, recovery_attempts, queue_name, workflow_timeout_ms,
 				workflow_deadline_epoch_ms, started_at_epoch_ms, deduplication_id, inputs, priority,
-				queue_partition_key, forked_from, parent_workflow_id, delay_until_epoch_ms
-			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27)`,
+				queue_partition_key, forked_from, parent_workflow_id, delay_until_epoch_ms, serialization
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28)`,
 			pgx.Identifier{s.schema}.Sanitize())
 
 		_, err := tx.Exec(ctx, insertStatusQuery,
@@ -4009,7 +4430,7 @@ func (s *sysDB) importWorkflow(ctx context.Context, workflows []ExportedWorkflow
 			status["workflow_timeout_ms"], status["workflow_deadline_epoch_ms"], status["started_at_epoch_ms"],
 			status["deduplication_id"], status["inputs"], status["priority"],
 			status["queue_partition_key"], status["forked_from"], status["parent_workflow_id"],
-			status["delay_until_epoch_ms"],
+			status["delay_until_epoch_ms"], status["serialization"],
 		)
 		if err != nil {
 			return fmt.Errorf("failed to import workflow_status: %w", err)

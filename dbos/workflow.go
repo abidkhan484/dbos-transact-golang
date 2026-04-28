@@ -3,6 +3,7 @@ package dbos
 import (
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
@@ -13,7 +14,6 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
-	"github.com/robfig/cron/v3"
 )
 
 /*******************************/
@@ -512,37 +512,22 @@ func registerScheduledWorkflow(ctx DBOSContext, workflowFQN, customName string, 
 	registryEntry.CronSchedule = cronSchedule
 	c.workflowRegistry.Store(workflowFQN, registryEntry)
 
-	var entryID cron.EntryID
-	entryID, err := c.getWorkflowScheduler().AddFunc(cronSchedule, func() {
-		// Execute the workflow on the cron schedule once DBOS is launched
-		if !c.launched.Load() {
-			return
-		}
-		// Get the scheduled time from the cron entry
-		entry := c.getWorkflowScheduler().Entry(entryID)
-		scheduledTime := entry.Prev
-		if scheduledTime.IsZero() {
-			// Use Next if Prev is not set, which will only happen for the first run
-			scheduledTime = entry.Next
-		}
-
-		name := workflowFQN
-		if len(customName) > 0 {
-			name = customName
-		}
-
+	name := workflowFQN
+	if len(customName) > 0 {
+		name = customName
+	}
+	scheduled := ScheduledWorkflowFunc(func(ctx DBOSContext, input ScheduledWorkflowInput) (any, error) {
+		scheduledTime := input.ScheduledTime
 		wfID := fmt.Sprintf("sched-%s-%s", name, scheduledTime)
 		opts := []WorkflowOption{
 			WithWorkflowID(wfID),
 			WithQueue(_DBOS_INTERNAL_QUEUE_NAME),
 			withWorkflowName(workflowFQN),
 		}
-		_, err := ctx.RunWorkflow(ctx, fn, scheduledTime, opts...)
-		if err != nil {
-			c.logger.Error("failed to run scheduled workflow", "fqn", workflowFQN, "customName", customName, "error", err)
-		}
+		return ctx.RunWorkflow(ctx, fn, scheduledTime, opts...)
 	})
-	if err != nil {
+
+	if _, err := c.addScheduleCronEntry(name, cronSchedule, scheduled, nil); err != nil {
 		panic(fmt.Sprintf("failed to register scheduled workflow: %v", err))
 	}
 	c.logger.Info("Registered scheduled workflow", "fqn", workflowFQN, "customName", customName, "cron_schedule", cronSchedule)
@@ -707,6 +692,23 @@ func RegisterWorkflow[P any, R any](ctx DBOSContext, fn Workflow[P, R], opts ...
 		})
 		registerScheduledWorkflow(ctx, fqn, registrationParams.name, scheduledWfFunc, registrationParams.cronSchedule)
 	}
+}
+
+// resolveWorkflowName returns either the FQN or the custom name of a function, if present in the workflow registry
+func (c *dbosContext) resolveWorkflowName(workflowFn any) (string, error) {
+	if workflowFn == nil {
+		return "", errors.New("workflow function is required")
+	}
+	fqn := runtime.FuncForPC(reflect.ValueOf(workflowFn).Pointer()).Name()
+	value, ok := c.workflowRegistry.Load(fqn)
+	if !ok {
+		return "", fmt.Errorf("workflow function not registered: %s", fqn)
+	}
+	entry := value.(WorkflowRegistryEntry)
+	if entry.Name != "" {
+		return entry.Name, nil
+	}
+	return entry.FQN, nil
 }
 
 /**********************************/
@@ -1471,13 +1473,6 @@ func WithMaxInterval(interval time.Duration) StepOption {
 func WithNextStepID(stepID int) StepOption {
 	return func(opts *stepOptions) {
 		opts.preGeneratedStepID = &stepID
-	}
-}
-
-// withTxIsolationLevel sets the transaction isolation level for runAsTxn (package-private).
-func withTxIsolationLevel(level pgx.TxIsoLevel) StepOption {
-	return func(opts *stepOptions) {
-		opts.txIsoLevel = &level
 	}
 }
 
@@ -4037,4 +4032,536 @@ func ListenQueues(ctx DBOSContext, queues ...WorkflowQueue) {
 		panic("ctx cannot be nil")
 	}
 	ctx.ListenQueues(ctx, queues...)
+}
+
+/*******************************/
+/******* SCHEDULE MANAGEMENT ********/
+/*******************************/
+
+// validateScheduledWorkflowFn ensures fn has signature
+// func(DBOSContext, ScheduledWorkflowInput) (any, error). Used by
+// ApplySchedules where each entry's WorkflowFn is type-erased.
+func validateScheduledWorkflowFn(fn any) error {
+	t := reflect.TypeOf(fn)
+	if t == nil || t.Kind() != reflect.Func {
+		return errors.New("workflow function must be a function")
+	}
+	if t.NumIn() < 2 {
+		return errors.New("workflow function must accept (DBOSContext, ScheduledWorkflowInput)")
+	}
+	if t.In(1) != reflect.TypeFor[ScheduledWorkflowInput]() {
+		return fmt.Errorf("scheduled workflow function must accept a ScheduledWorkflowInput as input, got %v", t.In(1))
+	}
+	return nil
+}
+
+func (c *dbosContext) CreateSchedule(_ DBOSContext, fn ScheduledWorkflowFunc, input CreateScheduleRequest, opts ...CreateScheduleOption) error {
+	if input.ScheduleName == "" {
+		return errors.New("schedule_name is required")
+	}
+
+	workflowName, err := c.resolveWorkflowName(fn)
+	if err != nil {
+		return err
+	}
+
+	var o createScheduleOptions
+	for _, opt := range opts {
+		opt(&o)
+	}
+
+	if err := validateCronSchedule(input.Schedule, o.cronTimezone); err != nil {
+		return err
+	}
+
+	contextJSON, err := json.Marshal(o.context)
+	if err != nil {
+		return fmt.Errorf("failed to serialize context: %w", err)
+	}
+
+	scheduleID := uuid.New().String()
+	dbInput := createScheduleDBInput{
+		ScheduleID:        scheduleID,
+		ScheduleName:      input.ScheduleName,
+		WorkflowName:      workflowName,
+		WorkflowClassName: o.workflowClassName,
+		Schedule:          input.Schedule,
+		Context:           string(contextJSON),
+		Status:            ScheduleStatusActive,
+		AutomaticBackfill: o.automaticBackfill,
+		CronTimezone:      o.cronTimezone,
+		QueueName:         o.queueName,
+	}
+
+	if state, inWorkflow := c.Value(workflowStateKey).(*workflowState); inWorkflow && state != nil {
+		_, err := runAsTxn(c, func(ctx context.Context, tx pgx.Tx) (any, error) {
+			input := dbInput
+			input.tx = tx
+			return nil, c.systemDB.createSchedule(ctx, input)
+		}, WithStepName("DBOS.createSchedule"))
+		return err
+	}
+
+	return retry(c, func() error {
+		return c.systemDB.createSchedule(c, dbInput)
+	}, withRetrierLogger(c.logger))
+}
+
+// CreateScheduleRequest carries the mandatory fields for CreateSchedule.
+// Optional settings are configured via CreateScheduleOption.
+type CreateScheduleRequest struct {
+	ScheduleName string
+	Schedule     string
+}
+
+type createScheduleOptions struct {
+	context           any
+	automaticBackfill bool
+	cronTimezone      string
+	queueName         string
+	workflowClassName string
+}
+
+type CreateScheduleOption func(*createScheduleOptions)
+
+// WithScheduleContext attaches a user-defined context (serialized as JSON)
+// passed to each scheduled invocation.
+func WithScheduleContext(context any) CreateScheduleOption {
+	return func(o *createScheduleOptions) { o.context = context }
+}
+
+// WithAutomaticBackfill enables backfilling missed ticks when the schedule is
+// reloaded after downtime.
+func WithAutomaticBackfill(enabled bool) CreateScheduleOption {
+	return func(o *createScheduleOptions) { o.automaticBackfill = enabled }
+}
+
+// WithCronTimezone sets the IANA timezone used to interpret the cron
+// expression.
+func WithCronTimezone(tz string) CreateScheduleOption {
+	return func(o *createScheduleOptions) { o.cronTimezone = tz }
+}
+
+// WithScheduleQueueName routes each scheduled invocation to the named queue
+// instead of the default internal queue.
+func WithScheduleQueueName(name string) CreateScheduleOption {
+	return func(o *createScheduleOptions) { o.queueName = name }
+}
+
+// WithScheduleWorkflowClassName records a class/namespace name on the schedule
+// for cross-language dispatch. Use this when the scheduled workflow is owned
+// by a non-Go runtime (e.g. a Python class-based workflow) so the stored
+// schedule and Conductor view carry the correct class name.
+func WithScheduleWorkflowClassName(name string) CreateScheduleOption {
+	return func(o *createScheduleOptions) { o.workflowClassName = name }
+}
+
+// listSchedulesOptions holds configuration parameters for listing schedules.
+type listSchedulesOptions struct {
+	statuses             []ScheduleStatus
+	workflowNames        []string
+	scheduleNamePrefixes []string
+}
+
+// CreateSchedule creates a new schedule for a workflow. The reconciler loop
+// picks the new schedule up on its next tick and installs it in the cron
+// scheduler. The fn must already be registered via RegisterWorkflow.
+//
+// Example:
+//
+//	err := dbos.CreateSchedule(ctx, myWorkflow, dbos.CreateScheduleRequest{
+//	    ScheduleName: "my-schedule",
+//	    Schedule:     "*/5 * * * *",
+//	}, dbos.WithScheduleContext("my context"))
+func CreateSchedule(ctx DBOSContext, fn ScheduledWorkflowFunc, input CreateScheduleRequest, opts ...CreateScheduleOption) error {
+	if ctx == nil {
+		return errors.New("ctx cannot be nil")
+	}
+	if fn == nil {
+		return errors.New("workflow function cannot be nil")
+	}
+	return ctx.CreateSchedule(ctx, fn, input, opts...)
+}
+
+func (c *dbosContext) ApplySchedules(_ DBOSContext, schedules []ApplySchedulesRequest) error {
+	if state, ok := c.Value(workflowStateKey).(*workflowState); ok && state != nil {
+		return errors.New("DBOS.ApplySchedules cannot be called from within a workflow")
+	}
+
+	if len(schedules) == 0 {
+		return nil
+	}
+
+	for _, req := range schedules {
+		if req.ScheduleName == "" {
+			return errors.New("schedule_name is required")
+		}
+		if err := validateCronSchedule(req.Schedule, req.CronTimezone); err != nil {
+			return err
+		}
+		if err := validateScheduledWorkflowFn(req.WorkflowFn); err != nil {
+			return err
+		}
+	}
+
+	return retry(c, func() error {
+		tx, err := c.systemDB.(*sysDB).pool.Begin(c)
+		if err != nil {
+			return fmt.Errorf("failed to begin transaction: %w", err)
+		}
+		defer tx.Rollback(c)
+
+		for _, req := range schedules {
+			workflowName, err := c.resolveWorkflowName(req.WorkflowFn)
+			if err != nil {
+				return err
+			}
+
+			contextJSON, err := json.Marshal(req.Context)
+			if err != nil {
+				return fmt.Errorf("failed to serialize context: %w", err)
+			}
+
+			queueName := req.QueueName
+			if queueName == "" {
+				queueName = _DBOS_INTERNAL_QUEUE_NAME
+			}
+
+			// Delete any existing schedule with this name, then create the new one.
+			if err := c.systemDB.deleteSchedule(c, deleteScheduleDBInput{
+				ScheduleName: req.ScheduleName,
+				tx:           tx,
+			}); err != nil {
+				return fmt.Errorf("failed to delete existing schedule: %w", err)
+			}
+
+			scheduleID := uuid.New().String()
+			if err := c.systemDB.createSchedule(c, createScheduleDBInput{
+				ScheduleID:        scheduleID,
+				ScheduleName:      req.ScheduleName,
+				WorkflowName:      workflowName,
+				Schedule:          req.Schedule,
+				Context:           string(contextJSON),
+				Status:            ScheduleStatusActive,
+				AutomaticBackfill: req.AutomaticBackfill,
+				CronTimezone:      req.CronTimezone,
+				QueueName:         queueName,
+				tx:                tx,
+			}); err != nil {
+				return fmt.Errorf("failed to create schedule: %w", err)
+			}
+		}
+
+		if err := tx.Commit(c); err != nil {
+			return fmt.Errorf("failed to commit transaction: %w", err)
+		}
+		return nil
+	}, withRetrierLogger(c.logger))
+}
+
+// ApplySchedules applies a list of schedules, creating new ones or updating existing ones.
+// This is useful for defining a set of static schedules to be created on program start.
+//
+// Example:
+//
+//	err := dbos.ApplySchedules(ctx, []dbos.ApplySchedulesRequest{
+//	    {ScheduleName: "schedule-a", WorkflowFn: workflowA, Schedule: "*/10 * * * *"},
+//	    {ScheduleName: "schedule-b", WorkflowFn: workflowB, Schedule: "0 0 * * *"},
+//	})
+func ApplySchedules(ctx DBOSContext, schedules []ApplySchedulesRequest) error {
+	if ctx == nil {
+		return errors.New("ctx cannot be nil")
+	}
+	return ctx.ApplySchedules(ctx, schedules)
+}
+
+func (c *dbosContext) PauseSchedule(_ DBOSContext, scheduleName string) error {
+	if scheduleName == "" {
+		return errors.New("schedule_name is required")
+	}
+
+	existing, err := c.GetSchedule(c, scheduleName)
+	if err != nil {
+		return fmt.Errorf("failed to get schedule: %w", err)
+	}
+	if existing == nil {
+		return fmt.Errorf("schedule not found: %s", scheduleName)
+	}
+
+	dbInput := updateScheduleDBInput{
+		ScheduleName: scheduleName,
+		Status:       ScheduleStatusPaused,
+	}
+
+	if state, inWorkflow := c.Value(workflowStateKey).(*workflowState); inWorkflow && state != nil {
+		_, err := runAsTxn(c, func(ctx context.Context, tx pgx.Tx) (any, error) {
+			in := dbInput
+			in.tx = tx
+			return nil, c.systemDB.updateSchedule(ctx, in)
+		}, WithStepName("DBOS.pauseSchedule"))
+		return err
+	}
+
+	return retry(c, func() error {
+		return c.systemDB.updateSchedule(c, dbInput)
+	}, withRetrierLogger(c.logger))
+}
+
+// PauseSchedule pauses a schedule so it stops firing.
+//
+// Example:
+//
+//	err := dbos.PauseSchedule(ctx, "my-schedule")
+func PauseSchedule(ctx DBOSContext, scheduleName string) error {
+	if ctx == nil {
+		return errors.New("ctx cannot be nil")
+	}
+	return ctx.PauseSchedule(ctx, scheduleName)
+}
+
+func (c *dbosContext) ResumeSchedule(_ DBOSContext, scheduleName string) error {
+	if scheduleName == "" {
+		return errors.New("schedule_name is required")
+	}
+
+	existing, err := c.GetSchedule(c, scheduleName)
+	if err != nil {
+		return fmt.Errorf("failed to get schedule: %w", err)
+	}
+	if existing == nil {
+		return fmt.Errorf("schedule not found: %s", scheduleName)
+	}
+
+	dbInput := updateScheduleDBInput{
+		ScheduleName: scheduleName,
+		Status:       ScheduleStatusActive,
+	}
+
+	if state, inWorkflow := c.Value(workflowStateKey).(*workflowState); inWorkflow && state != nil {
+		_, err := runAsTxn(c, func(ctx context.Context, tx pgx.Tx) (any, error) {
+			in := dbInput
+			in.tx = tx
+			return nil, c.systemDB.updateSchedule(ctx, in)
+		}, WithStepName("DBOS.resumeSchedule"))
+		return err
+	}
+
+	return retry(c, func() error {
+		return c.systemDB.updateSchedule(c, dbInput)
+	}, withRetrierLogger(c.logger))
+}
+
+// ResumeSchedule resumes a paused schedule.
+//
+// Example:
+//
+//	err := dbos.ResumeSchedule(ctx, "my-schedule")
+func ResumeSchedule(ctx DBOSContext, scheduleName string) error {
+	if ctx == nil {
+		return errors.New("ctx cannot be nil")
+	}
+	return ctx.ResumeSchedule(ctx, scheduleName)
+}
+
+func (c *dbosContext) DeleteSchedule(_ DBOSContext, scheduleName string) error {
+	if scheduleName == "" {
+		return errors.New("schedule_name is required")
+	}
+
+	if state, inWorkflow := c.Value(workflowStateKey).(*workflowState); inWorkflow && state != nil {
+		_, err := runAsTxn(c, func(ctx context.Context, tx pgx.Tx) (any, error) {
+			return nil, c.systemDB.deleteSchedule(ctx, deleteScheduleDBInput{ScheduleName: scheduleName, tx: tx})
+		}, WithStepName("DBOS.deleteSchedule"))
+		return err
+	}
+
+	return retry(c, func() error {
+		return c.systemDB.deleteSchedule(c, deleteScheduleDBInput{ScheduleName: scheduleName})
+	}, withRetrierLogger(c.logger))
+}
+
+// DeleteSchedule deletes a schedule.
+//
+// Example:
+//
+//	err := dbos.DeleteSchedule(ctx, "my-schedule")
+func DeleteSchedule(ctx DBOSContext, scheduleName string) error {
+	if ctx == nil {
+		return errors.New("ctx cannot be nil")
+	}
+	return ctx.DeleteSchedule(ctx, scheduleName)
+}
+
+// Potentially we could return an error here, if helpful to the user, if the schedule is not found.
+func (c *dbosContext) GetSchedule(_ DBOSContext, scheduleName string) (*WorkflowSchedule, error) {
+	if scheduleName == "" {
+		return nil, errors.New("schedule_name is required")
+	}
+
+	dbInput := listSchedulesDBInput{ScheduleNamePrefixes: []string{scheduleName}}
+
+	var schedules []WorkflowSchedule
+	var err error
+	if state, inWorkflow := c.Value(workflowStateKey).(*workflowState); inWorkflow && state != nil {
+		schedules, err = runAsTxn(c, func(ctx context.Context, tx pgx.Tx) ([]WorkflowSchedule, error) {
+			in := dbInput
+			in.tx = tx
+			return c.systemDB.listSchedules(ctx, in)
+		}, WithStepName("DBOS.getSchedule"))
+	} else {
+		schedules, err = retryWithResult(c, func() ([]WorkflowSchedule, error) {
+			return c.systemDB.listSchedules(c, dbInput)
+		}, withRetrierLogger(c.logger))
+	}
+	if err != nil {
+		return nil, err
+	}
+	for i := range schedules {
+		if schedules[i].ScheduleName == scheduleName {
+			return &schedules[i], nil
+		}
+	}
+	return nil, nil
+}
+
+// GetSchedule gets a schedule by name.
+//
+// Example:
+//
+//	schedule, err := dbos.GetSchedule(ctx, "my-schedule")
+func GetSchedule(ctx DBOSContext, scheduleName string) (*WorkflowSchedule, error) {
+	if ctx == nil {
+		return nil, errors.New("ctx cannot be nil")
+	}
+	return ctx.GetSchedule(ctx, scheduleName)
+}
+
+func (c *dbosContext) ListSchedules(_ DBOSContext, opts ...ListSchedulesOption) ([]WorkflowSchedule, error) {
+	var o listSchedulesOptions
+	for _, opt := range opts {
+		opt(&o)
+	}
+	dbInput := listSchedulesDBInput{
+		Statuses:             o.statuses,
+		WorkflowNames:        o.workflowNames,
+		ScheduleNamePrefixes: o.scheduleNamePrefixes,
+	}
+	if state, inWorkflow := c.Value(workflowStateKey).(*workflowState); inWorkflow && state != nil {
+		return runAsTxn(c, func(ctx context.Context, tx pgx.Tx) ([]WorkflowSchedule, error) {
+			in := dbInput
+			in.tx = tx
+			return c.systemDB.listSchedules(ctx, in)
+		}, WithStepName("DBOS.listSchedules"))
+	}
+	return retryWithResult(c, func() ([]WorkflowSchedule, error) {
+		return c.systemDB.listSchedules(c, dbInput)
+	}, withRetrierLogger(c.logger))
+}
+
+// ListSchedulesOption is a functional option for configuring schedule listing parameters.
+type ListSchedulesOption func(*listSchedulesOptions)
+
+// WithScheduleStatuses filters schedules by the specified status(es).
+func WithScheduleStatuses(statuses ...ScheduleStatus) ListSchedulesOption {
+	return func(o *listSchedulesOptions) { o.statuses = statuses }
+}
+
+// WithScheduleWorkflowNames filters schedules by the specified workflow name(s).
+func WithScheduleWorkflowNames(names ...string) ListSchedulesOption {
+	return func(o *listSchedulesOptions) { o.workflowNames = names }
+}
+
+// WithScheduleNamePrefixes filters schedules by schedule name prefix(es).
+func WithScheduleNamePrefixes(prefixes ...string) ListSchedulesOption {
+	return func(o *listSchedulesOptions) { o.scheduleNamePrefixes = prefixes }
+}
+
+// ListSchedules lists schedules, optionally filtered by the supplied options.
+// Pass no options to return all schedules.
+//
+// Example:
+//
+//	schedules, err := dbos.ListSchedules(ctx, dbos.WithScheduleStatuses(dbos.ScheduleStatusActive))
+func ListSchedules(ctx DBOSContext, opts ...ListSchedulesOption) ([]WorkflowSchedule, error) {
+	if ctx == nil {
+		return nil, errors.New("ctx cannot be nil")
+	}
+	return ctx.ListSchedules(ctx, opts...)
+}
+
+func (c *dbosContext) BackfillSchedule(_ DBOSContext, scheduleName string, start time.Time, end time.Time) ([]string, error) {
+	if state, ok := c.Value(workflowStateKey).(*workflowState); ok && state != nil {
+		return nil, errors.New("DBOS.BackfillSchedule cannot be called from within a workflow")
+	}
+	if scheduleName == "" {
+		return nil, errors.New("schedule_name is required")
+	}
+
+	existing, err := c.GetSchedule(c, scheduleName)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get schedule: %w", err)
+	}
+	if existing == nil {
+		return nil, fmt.Errorf("schedule not found: %s", scheduleName)
+	}
+
+	var ids []string
+	err = retry(c, func() error {
+		var bfErr error
+		ids, bfErr = c.systemDB.backfillSchedule(c, backfillScheduleDBInput{
+			ScheduleName: scheduleName,
+			Schedule:     existing.Schedule,
+			StartTime:    start,
+			EndTime:      end,
+		})
+		return bfErr
+	}, withRetrierLogger(c.logger))
+	if err != nil {
+		return nil, err
+	}
+	return ids, nil
+}
+
+// BackfillSchedule backfills a schedule, executing it for each time slot in the range.
+// Already-executed times are automatically skipped. Returns the IDs of the
+// workflows enqueued for the backfilled time slots.
+//
+// Example:
+//
+//	ids, err := dbos.BackfillSchedule(ctx, "my-schedule", startTime, endTime)
+func BackfillSchedule(ctx DBOSContext, scheduleName string, start, end time.Time) ([]string, error) {
+	if ctx == nil {
+		return nil, errors.New("ctx cannot be nil")
+	}
+	return ctx.BackfillSchedule(ctx, scheduleName, start, end)
+}
+
+func (c *dbosContext) TriggerSchedule(_ DBOSContext, scheduleName string) (WorkflowHandle[any], error) {
+	if scheduleName == "" {
+		return nil, errors.New("schedule_name is required")
+	}
+
+	workflowState, ok := c.Value(workflowStateKey).(*workflowState)
+	if ok && workflowState != nil {
+		return nil, errors.New("DBOS.TriggerSchedule cannot be called from within a workflow")
+	}
+
+	workflowID, err := c.systemDB.triggerSchedule(c, scheduleName)
+	if err != nil {
+		return nil, err
+	}
+	return newWorkflowPollingHandle[any](c, workflowID), nil
+}
+
+// TriggerSchedule triggers a schedule immediately, returning a handle to the
+// enqueued workflow.
+//
+// Example:
+//
+//	handle, err := dbos.TriggerSchedule(ctx, "my-schedule")
+func TriggerSchedule(ctx DBOSContext, scheduleName string) (WorkflowHandle[any], error) {
+	if ctx == nil {
+		return nil, errors.New("ctx cannot be nil")
+	}
+	return ctx.TriggerSchedule(ctx, scheduleName)
 }
