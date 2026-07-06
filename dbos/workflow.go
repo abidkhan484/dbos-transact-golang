@@ -65,6 +65,7 @@ type WorkflowStatus struct {
 	ConfigName         *string            `json:"config_name,omitempty"`         // Instance/config name for cross-language dispatch (nil = unset, pointer to "" = explicit empty)
 	Serialization      string             `json:"serialization,omitempty"`       // Serialization format used for inputs/outputs (e.g., "DBOS_JSON", "portable_json")
 	DelayUntil         time.Time          `json:"delay_until,omitempty"`         // The time before which the workflow should not be dequeued
+	Attributes         map[string]any     `json:"attributes,omitempty"`          // Custom key-value attributes attached to the workflow at creation
 }
 
 // workflowState holds the runtime state for a workflow execution
@@ -862,6 +863,7 @@ type workflowOptions struct {
 	AuthenticatedRoles  []string
 	QueuePartitionKey   string
 	DelayDuration       time.Duration
+	WorkflowAttributes  map[string]any
 	alreadyEncodedInput bool
 	isDequeue           bool
 	isRecovery          bool
@@ -935,6 +937,16 @@ func WithPriority(priority uint) WorkflowOption {
 func WithQueuePartitionKey(partitionKey string) WorkflowOption {
 	return func(p *workflowOptions) {
 		p.QueuePartitionKey = partitionKey
+	}
+}
+
+// WithWorkflowAttributes attaches custom key-value attributes to the workflow.
+// Attributes are recorded in the workflow status at creation, must be
+// JSON-serializable, and are not inherited by child workflows. On Postgres they
+// are stored as GIN-indexed JSONB and can be searched with WithFilterAttributes.
+func WithWorkflowAttributes(attributes map[string]any) WorkflowOption {
+	return func(p *workflowOptions) {
+		p.WorkflowAttributes = attributes
 	}
 }
 
@@ -1362,6 +1374,7 @@ func (c *dbosContext) RunWorkflow(_ DBOSContext, fn WorkflowFunc, input any, opt
 		AuthenticatedRoles: params.AuthenticatedRoles,
 		QueuePartitionKey:  params.QueuePartitionKey,
 		DelayUntil:         delayUntil,
+		Attributes:         params.WorkflowAttributes,
 		Serialization: func() string {
 			if params.isPortableWorkflow {
 				return PortableSerializerName
@@ -3626,6 +3639,44 @@ func CancelWorkflow(ctx DBOSContext, workflowID string, opts ...CancelWorkflowOp
 	return ctx.CancelWorkflow(ctx, workflowID, opts...)
 }
 
+func (c *dbosContext) UpdateWorkflowAttributes(_ DBOSContext, workflowID string, attributes map[string]any) error {
+	workflowState, ok := c.Value(workflowStateKey).(*workflowState)
+	isWithinWorkflow := ok && workflowState != nil
+
+	if isWithinWorkflow {
+		_, err := runAsTxn(c, func(ctx context.Context, tx Tx) (struct{}, error) {
+			return struct{}{}, c.systemDB.updateWorkflowAttributes(ctx, updateWorkflowAttributesDBInput{
+				workflowID: workflowID,
+				attributes: attributes,
+				tx:         tx,
+			})
+		}, WithStepName("DBOS.updateWorkflowAttributes"))
+		return err
+	}
+	return retry(c, func() error {
+		return c.systemDB.updateWorkflowAttributes(c, updateWorkflowAttributesDBInput{
+			workflowID: workflowID,
+			attributes: attributes,
+		})
+	}, withRetrierLogger(c.logger))
+}
+
+// UpdateWorkflowAttributes replaces the custom attributes attached to an existing
+// workflow, identified by workflowID. Pass a nil attributes map to clear all
+// attributes. Attributes must be JSON-serializable.
+//
+// Returns an error if the workflow does not exist or the update fails.
+//
+// Example:
+//
+//	err := dbos.UpdateWorkflowAttributes(ctx, "my-workflow-id", map[string]any{"customer": "acme"})
+func UpdateWorkflowAttributes(ctx DBOSContext, workflowID string, attributes map[string]any) error {
+	if ctx == nil {
+		return errors.New("ctx cannot be nil")
+	}
+	return ctx.UpdateWorkflowAttributes(ctx, workflowID, attributes)
+}
+
 func (c *dbosContext) CancelWorkflows(_ DBOSContext, workflowIDs []string, opts ...CancelWorkflowOptions) error {
 	workflowState, ok := c.Value(workflowStateKey).(*workflowState)
 	isWithinWorkflow := ok && workflowState != nil
@@ -4078,6 +4129,7 @@ type listWorkflowsOptions struct {
 	dequeuedBefore   time.Time
 	wasForkedFrom    *bool
 	hasParent        *bool
+	attributes       map[string]any
 }
 
 // ListWorkflowsOption is a functional option for configuring workflow listing parameters.
@@ -4259,6 +4311,15 @@ func WithHasParent(hasParent bool) ListWorkflowsOption {
 	}
 }
 
+// WithFilterAttributes filters workflows whose attributes contain all the given
+// key-value pairs (JSONB containment). Requires a Postgres system database;
+// listing fails with an error on SQLite.
+func WithFilterAttributes(attributes map[string]any) ListWorkflowsOption {
+	return func(p *listWorkflowsOptions) {
+		p.attributes = attributes
+	}
+}
+
 func (c *dbosContext) ListWorkflows(_ DBOSContext, opts ...ListWorkflowsOption) ([]WorkflowStatus, error) {
 	// Initialize parameters with defaults
 	loadInput := true
@@ -4309,6 +4370,7 @@ func (c *dbosContext) ListWorkflows(_ DBOSContext, opts ...ListWorkflowsOption) 
 		dequeuedBefore:     params.dequeuedBefore,
 		wasForkedFrom:      params.wasForkedFrom,
 		hasParent:          params.hasParent,
+		attributes:         params.attributes,
 	}
 
 	// Call the context method to list workflows
@@ -4640,6 +4702,14 @@ type GetWorkflowAggregatesInput struct {
 	ExecutorID         []string
 	QueueName          []string
 	WorkflowIDPrefix   []string
+	WorkflowIDs        []string
+	AuthenticatedUser  []string
+	ForkedFrom         []string
+	ParentWorkflowID   []string
+	WasForkedFrom      *bool
+	HasParent          *bool
+
+	Attributes map[string]any
 }
 
 func (c *dbosContext) GetWorkflowAggregates(_ DBOSContext, input GetWorkflowAggregatesInput) ([]WorkflowAggregateRow, error) {
@@ -4669,6 +4739,13 @@ func (c *dbosContext) GetWorkflowAggregates(_ DBOSContext, input GetWorkflowAggr
 		executorID:                input.ExecutorID,
 		queueName:                 input.QueueName,
 		workflowIDPrefix:          input.WorkflowIDPrefix,
+		workflowIDs:               input.WorkflowIDs,
+		authenticatedUser:         input.AuthenticatedUser,
+		forkedFrom:                input.ForkedFrom,
+		parentWorkflowID:          input.ParentWorkflowID,
+		wasForkedFrom:             input.WasForkedFrom,
+		hasParent:                 input.HasParent,
+		attributes:                input.Attributes,
 	}
 
 	workflowState, ok := c.Value(workflowStateKey).(*workflowState)
@@ -4690,7 +4767,9 @@ func (c *dbosContext) GetWorkflowAggregates(_ DBOSContext, input GetWorkflowAggr
 //
 // At least one GroupBy* flag in the input must be true, or TimeBucketSize must be > 0.
 // Filter fields (Status, StartTime, EndTime, Name, ApplicationVersion, ExecutorID,
-// QueueName, WorkflowIDPrefix) narrow which workflows are counted before grouping.
+// QueueName, WorkflowIDPrefix, WorkflowIDs, AuthenticatedUser, ForkedFrom,
+// ParentWorkflowID, WasForkedFrom, HasParent, Attributes) narrow which workflows are
+// counted before grouping. Attributes filtering requires a Postgres-compatible system database.
 //
 // At least one Select* flag must be true. Returns one WorkflowAggregateRow per non-empty
 // group. Each row's Group map contains an entry per enabled grouping column ("status",

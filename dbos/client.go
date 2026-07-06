@@ -34,6 +34,7 @@ type Client interface {
 	RetrieveWorkflow(workflowID string) (WorkflowHandle[any], error)
 	CancelWorkflow(workflowID string, opts ...CancelWorkflowOptions) error
 	CancelWorkflows(workflowIDs []string, opts ...CancelWorkflowOptions) error
+	UpdateWorkflowAttributes(workflowID string, attributes map[string]any) error
 	SetWorkflowDelay(workflowID string, opts ...SetWorkflowDelayOption) error
 	DeleteWorkflows(workflowIDs []string, opts ...DeleteWorkflowOption) error
 	ResumeWorkflow(workflowID string, opts ...ResumeWorkflowOption) (WorkflowHandle[any], error)
@@ -206,6 +207,15 @@ func WithEnqueueAuthenticatedRoles(roles []string) EnqueueOption {
 	}
 }
 
+// WithEnqueueAttributes attaches custom key-value attributes to the enqueued workflow.
+// Attributes are recorded in the workflow status at creation, must be
+// JSON-serializable, and can be searched with WithFilterAttributes on Postgres.
+func WithEnqueueAttributes(attributes map[string]any) EnqueueOption {
+	return func(opts *enqueueOptions) {
+		opts.attributes = attributes
+	}
+}
+
 type enqueueOptions struct {
 	workflowName        string
 	workflowID          string
@@ -222,6 +232,7 @@ type enqueueOptions struct {
 	authenticatedUser   string
 	assumedRole         string
 	authenticatedRoles  []string
+	attributes          map[string]any
 }
 
 // EnqueueWorkflow enqueues a workflow to a named queue for deferred execution.
@@ -324,6 +335,7 @@ func (c *client) Enqueue(queueName, workflowName string, input any, opts ...Enqu
 		AuthenticatedUser:  params.authenticatedUser,
 		AssumedRole:        params.assumedRole,
 		AuthenticatedRoles: params.authenticatedRoles,
+		Attributes:         params.attributes,
 	}
 
 	uncancellableCtx := WithoutCancel(dbosCtx)
@@ -499,6 +511,13 @@ func (c *client) CancelWorkflow(workflowID string, opts ...CancelWorkflowOptions
 		opt(&cwo)
 	}
 	return c.dbosCtx.CancelWorkflow(c.dbosCtx, workflowID, opts...)
+}
+
+// UpdateWorkflowAttributes replaces the custom attributes attached to an existing
+// workflow by ID. Pass a nil attributes map to clear all attributes. Returns an
+// error if the workflow does not exist.
+func (c *client) UpdateWorkflowAttributes(workflowID string, attributes map[string]any) error {
+	return c.dbosCtx.UpdateWorkflowAttributes(c.dbosCtx, workflowID, attributes)
 }
 
 // CancelWorkflows cancels multiple workflows in a single database round-trip.

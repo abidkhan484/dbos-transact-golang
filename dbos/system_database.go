@@ -35,6 +35,7 @@ type systemDatabase interface {
 	insertWorkflowStatus(ctx context.Context, input insertWorkflowStatusDBInput) (*insertWorkflowResult, error)
 	listWorkflows(ctx context.Context, input listWorkflowsDBInput) ([]WorkflowStatus, error)
 	updateWorkflowOutcome(ctx context.Context, input updateWorkflowOutcomeDBInput) error
+	updateWorkflowAttributes(ctx context.Context, input updateWorkflowAttributesDBInput) error
 	awaitWorkflowResult(ctx context.Context, workflowID string, pollInterval time.Duration) (*awaitWorkflowResultOutput, error)
 	cancelWorkflows(ctx context.Context, input cancelWorkflowsDBInput) ([]string, error)
 	cancelAllBefore(ctx context.Context, cutoffTime time.Time) error
@@ -991,6 +992,16 @@ func (s *sysDB) insertWorkflowStatus(ctx context.Context, input insertWorkflowSt
 		className = &input.status.ClassName
 	}
 
+	var attributesJSON *string
+	if len(input.status.Attributes) > 0 {
+		marshaled, err := json.Marshal(input.status.Attributes)
+		if err != nil {
+			return nil, fmt.Errorf("failed to marshal workflow attributes: %w", err)
+		}
+		attributesStr := string(marshaled)
+		attributesJSON = &attributesStr
+	}
+
 	query := s.renderSQL(`INSERT INTO %sworkflow_status (
         workflow_uuid,
         status,
@@ -1016,17 +1027,18 @@ func (s *sysDB) insertWorkflowStatus(ctx context.Context, input insertWorkflowSt
         class_name,
         config_name,
         serialization,
-        delay_until_epoch_ms
-    ) VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25)
+        delay_until_epoch_ms,
+        attributes
+    ) VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26)
     ON CONFLICT (workflow_uuid)
         DO UPDATE SET
 			recovery_attempts = CASE
-                WHEN EXCLUDED.status NOT IN ($26, $27) THEN workflow_status.recovery_attempts + $28
+                WHEN EXCLUDED.status NOT IN ($27, $28) THEN workflow_status.recovery_attempts + $29
                 ELSE workflow_status.recovery_attempts
             END,
             updated_at = EXCLUDED.updated_at,
             executor_id = CASE
-                WHEN EXCLUDED.status IN ($26, $27) THEN workflow_status.executor_id
+                WHEN EXCLUDED.status IN ($27, $28) THEN workflow_status.executor_id
                 ELSE EXCLUDED.executor_id
             END
         RETURNING recovery_attempts, status, name, queue_name, queue_partition_key, workflow_timeout_ms, workflow_deadline_epoch_ms, owner_xid`, s.dialect.SchemaPrefix(s.schema))
@@ -1073,6 +1085,7 @@ func (s *sysDB) insertWorkflowStatus(ctx context.Context, input insertWorkflowSt
 		input.status.ConfigName,
 		input.status.Serialization,
 		delayUntilEpochMs,
+		attributesJSON,
 		WorkflowStatusEnqueued,
 		WorkflowStatusDelayed,
 		recoveryIncrement,
@@ -1170,6 +1183,7 @@ type listWorkflowsDBInput struct {
 	dequeuedBefore     time.Time
 	wasForkedFrom      *bool
 	hasParent          *bool
+	attributes         map[string]any
 	limit              *int
 	offset             *int
 	sortDesc           bool
@@ -1189,6 +1203,7 @@ func (s *sysDB) listWorkflows(ctx context.Context, input listWorkflowsDBInput) (
 		"recovery_attempts", "queue_name", "workflow_timeout_ms", "workflow_deadline_epoch_ms", "started_at_epoch_ms",
 		"deduplication_id", "priority", "queue_partition_key", "forked_from", "parent_workflow_id",
 		"serialization", "delay_until_epoch_ms", "was_forked_from", "completed_at", "class_name", "config_name",
+		"attributes",
 	}
 
 	if input.loadOutput {
@@ -1267,6 +1282,19 @@ func (s *sysDB) listWorkflows(ctx context.Context, input listWorkflowsDBInput) (
 			qb.addWhereIsNull("parent_workflow_id")
 		}
 	}
+	if len(input.attributes) > 0 {
+		if !s.dialect.SupportsAttributesContainment() {
+			return nil, fmt.Errorf("filtering workflows by attributes is not supported on %s; use a Postgres system database to filter by attributes", s.dialect.Name())
+		}
+		attributesJSON, err := json.Marshal(input.attributes)
+		if err != nil {
+			return nil, fmt.Errorf("failed to marshal attributes filter: %w", err)
+		}
+		// JSONB containment (@>), served by the GIN index on the attributes column
+		qb.argCounter++
+		qb.whereClauses = append(qb.whereClauses, fmt.Sprintf("attributes @> $%d::jsonb", qb.argCounter))
+		qb.args = append(qb.args, string(attributesJSON))
+	}
 
 	// Build complete query
 	var query string
@@ -1336,6 +1364,7 @@ func (s *sysDB) listWorkflows(ctx context.Context, input listWorkflowsDBInput) (
 		var delayUntilEpochMs *int64
 		var completedAtMs *int64
 		var className *string
+		var attributesJSON *string
 
 		// Build scan arguments dynamically based on loaded columns.
 		scanArgs := []any{
@@ -1345,6 +1374,7 @@ func (s *sysDB) listWorkflows(ctx context.Context, input listWorkflowsDBInput) (
 			&wf.Attempts, &queueName, &timeoutMs,
 			&deadlineMs, &startedAtMs, &deduplicationID, &wf.Priority, &queuePartitionKey, &forkedFrom, &parentWorkflowID,
 			&serialization, &delayUntilEpochMs, &wf.WasForkedFrom, &completedAtMs, &className, &wf.ConfigName,
+			&attributesJSON,
 		}
 
 		if input.loadOutput {
@@ -1408,6 +1438,12 @@ func (s *sysDB) listWorkflows(ctx context.Context, input listWorkflowsDBInput) (
 
 		if serialization != nil && len(*serialization) > 0 {
 			wf.Serialization = *serialization
+		}
+
+		if attributesJSON != nil && len(*attributesJSON) > 0 {
+			if err := json.Unmarshal([]byte(*attributesJSON), &wf.Attributes); err != nil {
+				return nil, fmt.Errorf("failed to unmarshal attributes: %w", err)
+			}
 		}
 
 		// Convert milliseconds to time.Time
@@ -1490,6 +1526,48 @@ func (s *sysDB) updateWorkflowOutcome(ctx context.Context, input updateWorkflowO
 
 	if err != nil {
 		return fmt.Errorf("failed to update workflow status: %w", err)
+	}
+	return nil
+}
+
+type updateWorkflowAttributesDBInput struct {
+	workflowID string
+	attributes map[string]any
+	tx         Tx
+}
+
+// updateWorkflowAttributes replaces the custom attributes attached to an existing
+// workflow. A nil/empty attributes map clears them (stored as NULL). Returns a
+// non-existent workflow error if no workflow with the given ID exists.
+func (s *sysDB) updateWorkflowAttributes(ctx context.Context, input updateWorkflowAttributesDBInput) error {
+	var attributesJSON *string
+	if len(input.attributes) > 0 {
+		marshaled, err := json.Marshal(input.attributes)
+		if err != nil {
+			return fmt.Errorf("failed to marshal workflow attributes: %w", err)
+		}
+		attributesStr := string(marshaled)
+		attributesJSON = &attributesStr
+	}
+
+	query := s.renderSQL(`UPDATE %sworkflow_status SET attributes = $1, updated_at = $2 WHERE workflow_uuid = $3`, s.dialect.SchemaPrefix(s.schema))
+
+	var res Result
+	var err error
+	if input.tx != nil {
+		res, err = input.tx.Exec(ctx, query, attributesJSON, time.Now().UnixMilli(), input.workflowID)
+	} else {
+		res, err = s.pool.Exec(ctx, query, attributesJSON, time.Now().UnixMilli(), input.workflowID)
+	}
+	if err != nil {
+		return fmt.Errorf("failed to update workflow attributes: %w", err)
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("failed to read rows affected: %w", err)
+	}
+	if affected == 0 {
+		return newNonExistentWorkflowError(input.workflowID)
 	}
 	return nil
 }
@@ -2048,8 +2126,9 @@ func (s *sysDB) forkWorkflow(ctx context.Context, input forkWorkflowDBInput) (st
 		forked_from,
 		serialization,
 		class_name,
-		config_name
-	) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)`, s.dialect.SchemaPrefix(s.schema))
+		config_name,
+		attributes
+	) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)`, s.dialect.SchemaPrefix(s.schema))
 
 	// Marshal authenticated roles (slice of strings) to JSON for TEXT column
 	authenticatedRoles, err := json.Marshal(originalWorkflow.AuthenticatedRoles)
@@ -2065,6 +2144,15 @@ func (s *sysDB) forkWorkflow(ctx context.Context, input forkWorkflowDBInput) (st
 	var className any
 	if originalWorkflow.ClassName != "" {
 		className = originalWorkflow.ClassName
+	}
+
+	var attributesJSON any
+	if len(originalWorkflow.Attributes) > 0 {
+		marshaled, err := json.Marshal(originalWorkflow.Attributes)
+		if err != nil {
+			return "", fmt.Errorf("failed to marshal workflow attributes: %w", err)
+		}
+		attributesJSON = string(marshaled)
 	}
 
 	_, err = execCtx(ctx, insertQuery,
@@ -2085,7 +2173,8 @@ func (s *sysDB) forkWorkflow(ctx context.Context, input forkWorkflowDBInput) (st
 		input.originalWorkflowID, // forked_from
 		originalWorkflow.Serialization,
 		className,
-		originalWorkflow.ConfigName)
+		originalWorkflow.ConfigName,
+		attributesJSON)
 
 	if err != nil {
 		return "", fmt.Errorf("failed to insert forked workflow status: %w", err)
@@ -2595,6 +2684,13 @@ type getWorkflowAggregatesDBInput struct {
 	executorID                []string
 	queueName                 []string
 	workflowIDPrefix          []string
+	workflowIDs               []string
+	authenticatedUser         []string
+	forkedFrom                []string
+	parentWorkflowID          []string
+	wasForkedFrom             *bool
+	hasParent                 *bool
+	attributes                map[string]any
 	limit                     int64 // 0 means use _DEFAULT_AGGREGATES_LIMIT
 	tx                        Tx
 }
@@ -2679,6 +2775,41 @@ func (s *sysDB) getWorkflowAggregates(ctx context.Context, input getWorkflowAggr
 	}
 	if len(input.workflowIDPrefix) > 0 {
 		qb.addWhereLikeAny("workflow_uuid", input.workflowIDPrefix, "%")
+	}
+	if len(input.workflowIDs) > 0 {
+		qb.addWhereAny("workflow_uuid", input.workflowIDs)
+	}
+	if len(input.authenticatedUser) > 0 {
+		qb.addWhereAny("authenticated_user", input.authenticatedUser)
+	}
+	if len(input.forkedFrom) > 0 {
+		qb.addWhereAny("forked_from", input.forkedFrom)
+	}
+	if len(input.parentWorkflowID) > 0 {
+		qb.addWhereAny("parent_workflow_id", input.parentWorkflowID)
+	}
+	if input.wasForkedFrom != nil {
+		qb.addWhere("was_forked_from", *input.wasForkedFrom)
+	}
+	if input.hasParent != nil {
+		if *input.hasParent {
+			qb.addWhereIsNotNull("parent_workflow_id")
+		} else {
+			qb.addWhereIsNull("parent_workflow_id")
+		}
+	}
+	if len(input.attributes) > 0 {
+		if !s.dialect.SupportsAttributesContainment() {
+			return nil, fmt.Errorf("filtering workflows by attributes is not supported on %s; use a Postgres system database to filter by attributes", s.dialect.Name())
+		}
+		attributesJSON, err := json.Marshal(input.attributes)
+		if err != nil {
+			return nil, fmt.Errorf("failed to marshal attributes filter: %w", err)
+		}
+		// JSONB containment (@>), served by the GIN index on the attributes column
+		qb.argCounter++
+		qb.whereClauses = append(qb.whereClauses, fmt.Sprintf("attributes @> $%d::jsonb", qb.argCounter))
+		qb.args = append(qb.args, string(attributesJSON))
 	}
 	// completed_after/before filter on completed_at; dequeued_after/before on
 	// started_at_epoch_ms (the dequeue timestamp). Both are epoch-ms columns.
