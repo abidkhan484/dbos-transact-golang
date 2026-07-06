@@ -8214,6 +8214,12 @@ func TestFork(t *testing.T) {
 			require.Equal(t, int64(3), failStepOneCount.Load())   // replayed for all three forks
 			require.Equal(t, int64(4), failStepTwoCount.Load())   // re-run for wf1's fork only
 			require.Equal(t, int64(5), failStepThreeCount.Load()) // re-run for all three forks
+
+			// A fork also marks its source was_forked_from.
+			srcs, err := sysDB.listWorkflows(dbosCtx, listWorkflowsDBInput{workflowIDs: []string{wf1ID}})
+			require.NoError(t, err)
+			require.Len(t, srcs, 1)
+			require.True(t, srcs[0].WasForkedFrom, "a forked-from workflow should be marked was_forked_from")
 		})
 
 		t.Run("FromLastStep", func(t *testing.T) {
