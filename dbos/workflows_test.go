@@ -3180,23 +3180,6 @@ func receiveIdempotencyWorkflow(ctx DBOSContext, topic string) (string, error) {
 	return msg, nil
 }
 
-func durableRecvSleepWorkflow(ctx DBOSContext, topic string) (string, error) {
-	// First Recv with 2-second timeout (will timeout)
-	msg1, err := Recv[string](ctx, topic, 2*time.Second)
-	if err != nil && !strings.Contains(err.Error(), fmt.Sprintf("DBOS Error %s", TimeoutError)) {
-		return "", fmt.Errorf("unexpected error in first recv: %w", err)
-	}
-
-	// Second Recv with 2-second timeout (will also timeout)
-	msg2, err := Recv[string](ctx, topic, 2*time.Second)
-	if err != nil && !strings.Contains(err.Error(), fmt.Sprintf("DBOS Error %s", TimeoutError)) {
-		return "", fmt.Errorf("unexpected error in second recv: %w", err)
-	}
-
-	// Return result - will be empty strings since both timeout
-	return msg1 + msg2, nil
-}
-
 func stepThatCallsSend(ctx context.Context, input sendWorkflowInput) (string, error) {
 	err := Send(ctx.(DBOSContext), input.DestinationID, "message-from-step", input.Topic)
 	if err != nil {
@@ -3235,7 +3218,6 @@ func TestSendRecv(t *testing.T) {
 	RegisterWorkflow(dbosCtx, receiveStructWorkflow)
 	RegisterWorkflow(dbosCtx, sendIdempotencyWorkflow)
 	RegisterWorkflow(dbosCtx, receiveIdempotencyWorkflow)
-	RegisterWorkflow(dbosCtx, durableRecvSleepWorkflow)
 	RegisterWorkflow(dbosCtx, workflowThatCallsSendInStep)
 	RegisterWorkflow(dbosCtx, recvContextCancelWorkflow)
 
@@ -3405,6 +3387,73 @@ func TestSendRecv(t *testing.T) {
 		require.Contains(t, steps[0].Error.Error(), "DBOS.recv timed out", "expected step 0 to contain 'DBOS.recv timed out' in error message")
 		// Second step should be sleep
 		require.Equal(t, "DBOS.sleep", steps[1].StepName, "expected step 1 to have StepName 'DBOS.sleep'")
+	})
+
+	t.Run("RecvForkReplay", func(t *testing.T) {
+		sendRecvSyncEvent.Clear()
+
+		receiveHandle, err := RunWorkflow(dbosCtx, receiveIdempotencyWorkflow, "fork-replay-topic")
+		require.NoError(t, err, "failed to start receive workflow")
+
+		// Send the message before Recv runs so it is already pending (no sleep step recorded)
+		err = Send(dbosCtx, receiveHandle.GetWorkflowID(), "fork-me", "fork-replay-topic")
+		require.NoError(t, err, "failed to send message")
+		sendRecvSyncEvent.Set()
+
+		result, err := receiveHandle.GetResult()
+		require.NoError(t, err, "failed to get result from receive workflow")
+		require.Equal(t, "fork-me", result)
+
+		originalSteps, err := GetWorkflowSteps(dbosCtx, receiveHandle.GetWorkflowID())
+		require.NoError(t, err, "failed to get workflow steps")
+		require.Len(t, originalSteps, 1, "expected only the recv step when the message was already pending")
+
+		// Fork past the recv step: its checkpoint is copied and the recv must replay from it,
+		// without waiting (the recv timeout is 60 minutes) and without recording new steps.
+		start := time.Now()
+		forkedHandle, err := ForkWorkflow[string](dbosCtx, ForkWorkflowInput{
+			OriginalWorkflowID: receiveHandle.GetWorkflowID(),
+			StartStep:          2,
+		})
+		require.NoError(t, err, "failed to fork receive workflow")
+		forkedResult, err := forkedHandle.GetResult()
+		require.NoError(t, err, "failed to get result from forked receive workflow")
+		require.Equal(t, "fork-me", forkedResult, "forked recv should replay the checkpointed message")
+		require.Less(t, time.Since(start), 30*time.Second, "forked recv replay should not wait on the recv timeout")
+
+		forkedSteps, err := GetWorkflowSteps(dbosCtx, forkedHandle.GetWorkflowID())
+		require.NoError(t, err, "failed to get forked workflow steps")
+		require.Len(t, forkedSteps, 1, "recv replay must not record extra steps")
+		require.Equal(t, "DBOS.recv", forkedSteps[0].StepName)
+	})
+
+	t.Run("RecvTimeoutForkReplay", func(t *testing.T) {
+		sendRecvSyncEvent.Set()
+
+		receiveHandle, err := RunWorkflow(dbosCtx, receiveWorkflow, struct {
+			Topic   string
+			Timeout time.Duration
+		}{
+			Topic:   "timeout-fork-topic",
+			Timeout: 1 * time.Second,
+		})
+		require.NoError(t, err, "failed to start receive workflow")
+		_, err = receiveHandle.GetResult()
+		require.Error(t, err, "expected timeout error")
+
+		// Fork past the recv step: the checkpointed timeout error must round-trip through
+		// the recorded errStr with its concrete type and code preserved.
+		forkedHandle, err := ForkWorkflow[string](dbosCtx, ForkWorkflowInput{
+			OriginalWorkflowID: receiveHandle.GetWorkflowID(),
+			StartStep:          2,
+		})
+		require.NoError(t, err, "failed to fork receive workflow")
+		_, err = forkedHandle.GetResult()
+		require.Error(t, err, "expected replayed timeout error")
+		dbosErr, ok := err.(*DBOSError)
+		require.True(t, ok, "expected error to be of type *DBOSError, got %T", err)
+		require.Equal(t, TimeoutError, dbosErr.Code, "expected TimeoutError code")
+		require.Contains(t, err.Error(), "DBOS.recv timed out")
 	})
 
 	t.Run("RecvMustRunInsideWorkflows", func(t *testing.T) {
@@ -3612,6 +3661,93 @@ func TestSendRecv(t *testing.T) {
 		require.NoError(t, err, "failed to get workflow status")
 		require.Equal(t, WorkflowStatusCancelled, status.Status, "expected workflow status to be WorkflowStatusCancelled")
 	})
+
+	t.Run("ConcurrentRecvSameTopicConflicts", func(t *testing.T) {
+		// A single (destination, topic) may only have one active receiver at a time.
+		// A second concurrent registration must be rejected with a ConflictingIDError
+		// rather than silently sharing/stealing the first receiver's slot.
+		sysDB := dbosCtx.(*dbosContext).systemDB.(*sysDB)
+		destID := uuid.NewString()
+		topic := "single-receiver-topic"
+
+		waiter1, err := sysDB.startRecvListener(context.Background(), destID, topic)
+		require.NoError(t, err, "first receiver should register")
+		defer waiter1.release()
+
+		_, err = sysDB.startRecvListener(context.Background(), destID, topic)
+		require.Error(t, err, "second concurrent receiver for the same (destination, topic) must be rejected")
+		dbosErr, ok := err.(*DBOSError)
+		require.True(t, ok, "expected *DBOSError, got %T", err)
+		require.Equal(t, ConflictingIDError, dbosErr.Code, "expected ConflictingIDError")
+	})
+}
+
+// TestRecvStepConflict verifies that when two executors concurrently run the same
+// workflow and race to checkpoint the recv step, the loser does not fail: it either
+// replays the winner's checkpoint or loses the record race with a ConflictingIDError
+// that routes through the workflow-level conflict handler and awaits the winner's
+// result. Either way both executions converge on the delivered message.
+//
+// The two executors share one database (a single in-process guard cannot double-run
+// a workflow, so a real second executor is required). PostgreSQL row locking on
+// consumeMessage serializes consumption, making the converged outcome deterministic.
+func TestRecvStepConflict(t *testing.T) {
+	// checkLeaks is off: the two executors' lifetimes overlap, so a per-executor
+	// goroutine leak check would observe the other executor's live goroutines.
+	ctxA := setupDBOS(t, setupDBOSOptions{dropDB: true, checkLeaks: false})
+	ctxB := setupDBOS(t, setupDBOSOptions{dropDB: false, checkLeaks: false})
+
+	recvConflictWorkflow := func(ctx DBOSContext, topic string) (string, error) {
+		return Recv[string](ctx, topic, 60*time.Second)
+	}
+	RegisterWorkflow(ctxA, recvConflictWorkflow)
+	RegisterWorkflow(ctxB, recvConflictWorkflow)
+	require.NoError(t, Launch(ctxA))
+	require.NoError(t, Launch(ctxB))
+
+	topic := "recv-step-conflict-topic"
+	workflowID := uuid.NewString()
+
+	// Executor A starts the workflow; it registers as receiver and blocks in wait.
+	handleA, err := RunWorkflow(ctxA, recvConflictWorkflow, topic, WithWorkflowID(workflowID))
+	require.NoError(t, err, "failed to start recv workflow on executor A")
+
+	sysA := ctxA.(*dbosContext).systemDB.(*sysDB)
+	sysB := ctxB.(*dbosContext).systemDB.(*sysDB)
+	payload := fmt.Sprintf("%s::%s", workflowID, topic)
+	require.Eventually(t, func() bool {
+		_, ok := sysA.workflowNotificationsMap.Load(payload)
+		return ok
+	}, 5*time.Second, 10*time.Millisecond, "executor A never registered as receiver")
+
+	// Executor B recovers the same workflow: a genuinely concurrent second
+	// execution with its own in-memory receiver map, so it proceeds to wait and
+	// later races A to consume+checkpoint the message.
+	setWorkflowStatusPending(t, ctxA, workflowID)
+	recovered, err := recoverPendingWorkflows(ctxB.(*dbosContext), []string{"local"})
+	require.NoError(t, err, "failed to recover workflow on executor B")
+	require.Len(t, recovered, 1, "expected one recovered handle")
+	require.Equal(t, workflowID, recovered[0].GetWorkflowID())
+
+	// Executor B must actually run the body (register as receiver), not
+	// short-circuit; its separate map confirms a real concurrent execution.
+	require.Eventually(t, func() bool {
+		_, ok := sysB.workflowNotificationsMap.Load(payload)
+		return ok
+	}, 5*time.Second, 10*time.Millisecond, "executor B (recovery) never ran the body")
+
+	// Deliver the message. Exactly one executor consumes and checkpoints it; the
+	// other replays that checkpoint or loses the checkpoint race and awaits. Both
+	// must converge on the delivered value with no permanent failure.
+	require.NoError(t, Send(ctxA, workflowID, "delivered", topic), "failed to send message")
+
+	gotA, err := handleA.GetResult()
+	require.NoError(t, err, "executor A workflow should succeed")
+	require.Equal(t, "delivered", gotA)
+
+	gotB, err := recovered[0].GetResult()
+	require.NoError(t, err, "the concurrent recovery must converge on the result, not fail")
+	require.Equal(t, "delivered", gotB)
 }
 
 // receiveTwiceShortWorkflow receives one message (blocking up to 30s), then attempts a
@@ -3756,20 +3892,23 @@ func getEventIdempotencyWorkflow(ctx DBOSContext, input setEventWorkflowInput) (
 	return result, nil
 }
 
-func durableGetEventSleepWorkflow(ctx DBOSContext, targetWorkflowID string) (string, error) {
-	// First GetEvent with 2-second timeout (will timeout)
-	val1, err := GetEvent[string](ctx, targetWorkflowID, "key1", 2*time.Second)
-	if err != nil && !strings.Contains(err.Error(), "timed out") {
-		return "", fmt.Errorf("unexpected error in first getEvent: %w", err)
-	}
+func getEventForkReplayWorkflow(ctx DBOSContext, input getEventWorkflowInput) (string, error) {
+	return GetEvent[string](ctx, input.TargetWorkflowID, input.Key, 60*time.Minute)
+}
 
-	// Second GetEvent with 2-second timeout (will timeout)
-	val2, err := GetEvent[string](ctx, targetWorkflowID, "key2", 2*time.Second)
-	if err != nil && !strings.Contains(err.Error(), "timed out") {
-		return "", fmt.Errorf("unexpected error in second getEvent: %w", err)
-	}
+// setManyEventsWorkflow sets one event per (key, value) pair, so a single
+// workflow ID can back concurrent getters spread across several keys.
+type setManyEventsInput struct {
+	Values map[string]string
+}
 
-	return val1 + val2, nil
+func setManyEventsWorkflow(ctx DBOSContext, input setManyEventsInput) (string, error) {
+	for key, value := range input.Values {
+		if err := SetEvent(ctx, key, value); err != nil {
+			return "", err
+		}
+	}
+	return "many-events-set", nil
 }
 
 func TestSetGetEvent(t *testing.T) {
@@ -3781,7 +3920,8 @@ func TestSetGetEvent(t *testing.T) {
 	RegisterWorkflow(dbosCtx, setTwoEventsWorkflow)
 	RegisterWorkflow(dbosCtx, setEventIdempotencyWorkflow)
 	RegisterWorkflow(dbosCtx, getEventIdempotencyWorkflow)
-	RegisterWorkflow(dbosCtx, durableGetEventSleepWorkflow)
+	RegisterWorkflow(dbosCtx, getEventForkReplayWorkflow)
+	RegisterWorkflow(dbosCtx, setManyEventsWorkflow)
 
 	Launch(dbosCtx)
 
@@ -3965,6 +4105,85 @@ func TestSetGetEvent(t *testing.T) {
 		require.Contains(t, err.Error(), "no event found for key 'non-existent-key' within 3s", "expected error message to contain 'no event found for key 'non-existent-key' within 3s'")
 	})
 
+	t.Run("GetEventTimeoutInWorkflow", func(t *testing.T) {
+		// GetEvent waits and times out inside a workflow: the timeout error is
+		// checkpointed on the getEvent step and a sleep step records the deadline.
+		getHandle, err := RunWorkflow(dbosCtx, getEventWorkflow, getEventWorkflowInput{
+			TargetWorkflowID: uuid.NewString(),
+			Key:              "no-such-key",
+		})
+		require.NoError(t, err, "failed to start get event workflow")
+		_, err = getHandle.GetResult()
+		require.Error(t, err, "expected timeout error")
+		dbosErr, ok := err.(*DBOSError)
+		require.True(t, ok, "expected error to be of type *DBOSError, got %T", err)
+		require.Equal(t, TimeoutError, dbosErr.Code, "expected TimeoutError code")
+		require.Contains(t, err.Error(), "no event found for key 'no-such-key'")
+
+		steps, err := GetWorkflowSteps(dbosCtx, getHandle.GetWorkflowID())
+		require.NoError(t, err, "failed to get workflow steps")
+		require.Len(t, steps, 2, "expected 2 steps (getEvent that timed out and its sleep), got %d", len(steps))
+		require.Equal(t, "DBOS.getEvent", steps[0].StepName, "expected step 0 to have StepName 'DBOS.getEvent'")
+		require.NotNil(t, steps[0].Error, "expected getEvent step to record the timeout error")
+		require.Contains(t, steps[0].Error.Error(), "no event found for key 'no-such-key'")
+		require.Equal(t, "DBOS.sleep", steps[1].StepName, "expected step 1 to have StepName 'DBOS.sleep'")
+
+		// Fork past both steps: the checkpointed timeout error must round-trip through
+		// the recorded errStr with its concrete type and code preserved.
+		forkedHandle, err := ForkWorkflow[string](dbosCtx, ForkWorkflowInput{
+			OriginalWorkflowID: getHandle.GetWorkflowID(),
+			StartStep:          2,
+		})
+		require.NoError(t, err, "failed to fork get event workflow")
+		_, err = forkedHandle.GetResult()
+		require.Error(t, err, "expected replayed timeout error")
+		dbosErr, ok = err.(*DBOSError)
+		require.True(t, ok, "expected error to be of type *DBOSError, got %T", err)
+		require.Equal(t, TimeoutError, dbosErr.Code, "expected TimeoutError code")
+		require.Contains(t, err.Error(), "no event found for key 'no-such-key'")
+	})
+
+	t.Run("GetEventForkReplay", func(t *testing.T) {
+		setHandle, err := RunWorkflow(dbosCtx, setEventWorkflow, setEventWorkflowInput{
+			Key:     "fork-replay-key",
+			Message: "fork-me",
+		})
+		require.NoError(t, err, "failed to start set event workflow")
+		_, err = setHandle.GetResult()
+		require.NoError(t, err, "failed to get result from set event workflow")
+
+		getHandle, err := RunWorkflow(dbosCtx, getEventForkReplayWorkflow, getEventWorkflowInput{
+			TargetWorkflowID: setHandle.GetWorkflowID(),
+			Key:              "fork-replay-key",
+		})
+		require.NoError(t, err, "failed to start get event workflow")
+		result, err := getHandle.GetResult()
+		require.NoError(t, err, "failed to get result from get event workflow")
+		require.Equal(t, "fork-me", result)
+
+		originalSteps, err := GetWorkflowSteps(dbosCtx, getHandle.GetWorkflowID())
+		require.NoError(t, err, "failed to get workflow steps")
+		require.Len(t, originalSteps, 1, "expected only the getEvent step when the event was already set")
+
+		// Fork past the getEvent step: its checkpoint is copied and the getEvent must replay
+		// from it, without waiting (the timeout is 60 minutes) and without recording new steps.
+		start := time.Now()
+		forkedHandle, err := ForkWorkflow[string](dbosCtx, ForkWorkflowInput{
+			OriginalWorkflowID: getHandle.GetWorkflowID(),
+			StartStep:          2,
+		})
+		require.NoError(t, err, "failed to fork get event workflow")
+		forkedResult, err := forkedHandle.GetResult()
+		require.NoError(t, err, "failed to get result from forked get event workflow")
+		require.Equal(t, "fork-me", forkedResult, "forked getEvent should replay the checkpointed value")
+		require.Less(t, time.Since(start), 30*time.Second, "forked getEvent replay should not wait on the timeout")
+
+		forkedSteps, err := GetWorkflowSteps(dbosCtx, forkedHandle.GetWorkflowID())
+		require.NoError(t, err, "failed to get forked workflow steps")
+		require.Len(t, forkedSteps, 1, "getEvent replay must not record extra steps")
+		require.Equal(t, "DBOS.getEvent", forkedSteps[0].StepName)
+	})
+
 	t.Run("SetGetEventMustRunInsideWorkflows", func(t *testing.T) {
 		// Attempt to run SetEvent outside of a workflow context
 		err := SetEvent(dbosCtx, "test-key", "test-message")
@@ -4052,47 +4271,64 @@ func TestSetGetEvent(t *testing.T) {
 	})
 
 	t.Run("ConcurrentGetEvent", func(t *testing.T) {
-		// Set event
-		setHandle, err := RunWorkflow(dbosCtx, setEventWorkflow, setEventWorkflowInput{
-			Key:     "concurrent-event-key",
-			Message: "concurrent-event-message",
-		})
-		if err != nil {
-			t.Fatalf("failed to start set event workflow: %v", err)
+		// Spread more getters than keys: several getters share each key's condition
+		// variable (within-key concurrency) while distinct keys use independent
+		// condition variables (across-key concurrency). Getters start before the
+		// events are set so they block rather than taking the already-set fast path.
+		setWorkflowID := uuid.NewString()
+		const numKeys = 3
+		const numGoroutines = 12 // > numKeys, so multiple getters land on each key
+		keyFor := func(i int) string { return fmt.Sprintf("concurrent-event-key-%d", i%numKeys) }
+		valueFor := func(key string) string { return "value-for-" + key }
+
+		values := make(map[string]string, numKeys)
+		for k := range numKeys {
+			key := fmt.Sprintf("concurrent-event-key-%d", k)
+			values[key] = valueFor(key)
 		}
 
-		// Wait for the set event workflow to complete
-		_, err = setHandle.GetResult()
-		if err != nil {
-			t.Fatalf("failed to get result from set event workflow: %v", err)
-		}
-		// Start a few goroutines that'll concurrently get the event
-		numGoroutines := 5
 		var wg sync.WaitGroup
-		errors := make(chan error, numGoroutines)
+		errs := make(chan error, numGoroutines)
 		wg.Add(numGoroutines)
-		for range numGoroutines {
-			go func() {
+		for i := range numGoroutines {
+			go func(i int) {
 				defer wg.Done()
-				res, err := GetEvent[string](dbosCtx, setHandle.GetWorkflowID(), "concurrent-event-key", 10*time.Second)
+				key := keyFor(i)
+				res, err := GetEvent[string](dbosCtx, setWorkflowID, key, 30*time.Second)
 				if err != nil {
-					errors <- fmt.Errorf("failed to get event in goroutine: %v", err)
+					errs <- fmt.Errorf("goroutine %d (key %s): %w", i, key, err)
 					return
 				}
-				if res != "concurrent-event-message" {
-					errors <- fmt.Errorf("expected result in goroutine to be 'concurrent-event-message', got '%s'", res)
-					return
+				if want := valueFor(key); res != want {
+					errs <- fmt.Errorf("goroutine %d (key %s): expected %q, got %q", i, key, want, res)
 				}
-			}()
+			}(i)
 		}
-		wg.Wait()
-		close(errors)
 
-		// Check for any errors from goroutines
-		for err := range errors {
-			require.FailNow(t, "goroutine error: %v", err)
+		// Wait until every key has a registered waiter before setting the events.
+		sysDB := dbosCtx.(*dbosContext).systemDB.(*sysDB)
+		require.Eventually(t, func() bool {
+			for k := range numKeys {
+				payload := fmt.Sprintf("%s::%s", setWorkflowID, fmt.Sprintf("concurrent-event-key-%d", k))
+				if _, ok := sysDB.workflowEventsMap.Load(payload); !ok {
+					return false
+				}
+			}
+			return true
+		}, 5*time.Second, 10*time.Millisecond, "not all keys registered event waiters")
+
+		setHandle, err := RunWorkflow(dbosCtx, setManyEventsWorkflow, setManyEventsInput{Values: values}, WithWorkflowID(setWorkflowID))
+		require.NoError(t, err, "failed to start set-many-events workflow")
+		_, err = setHandle.GetResult()
+		require.NoError(t, err, "failed to get result from set-many-events workflow")
+
+		wg.Wait()
+		close(errs)
+		for err := range errs {
+			require.FailNow(t, "goroutine error", err)
 		}
 	})
+
 }
 
 // Test workflows and steps for parameter mismatch validation
