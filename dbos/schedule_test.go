@@ -1,6 +1,7 @@
 package dbos
 
 import (
+	"context"
 	"sync"
 	"testing"
 	"time"
@@ -572,6 +573,47 @@ func TestTriggerSchedule(t *testing.T) {
 	require.Equal(t, ctxValue, got.Context, "Context should match the schedule's configured context")
 	require.False(t, got.ScheduledTime.Before(beforeTrigger.Add(-time.Second)), "ScheduledTime should be at or after the trigger call")
 	require.False(t, got.ScheduledTime.After(afterTrigger.Add(time.Second)), "ScheduledTime should be at or before the trigger call returns")
+
+	// A second schedule sharing the same workflow function: ScheduleName is what
+	// distinguishes their runs, since both have the same workflow name.
+	err = CreateSchedule(dbosCtx, testCapturingScheduledWorkflow, CreateScheduleRequest{
+		ScheduleName: "trigger-schedule-b",
+		Schedule:     "0 0 * * * *",
+	}, WithScheduleContext(ctxValue))
+	require.NoError(t, err)
+	handleB, err := TriggerSchedule(dbosCtx, "trigger-schedule-b")
+	require.NoError(t, err)
+	_, err = handleB.GetResult()
+	require.NoError(t, err)
+
+	// Filter by a single schedule name: contains that schedule's run, tagged with
+	// its name, and excludes the other schedule's run. (Assert on membership, not
+	// exact counts, so a cron tick firing mid-test cannot flake the assertions.)
+	runsA, err := ListWorkflows(dbosCtx, WithFilterScheduleName("trigger-schedule"))
+	require.NoError(t, err)
+	idsA := make(map[string]bool, len(runsA))
+	for _, wf := range runsA {
+		require.Equal(t, "trigger-schedule", wf.ScheduleName)
+		idsA[wf.ID] = true
+	}
+	require.True(t, idsA[workflowID], "triggered run should match its schedule name filter")
+	require.False(t, idsA[handleB.GetWorkflowID()], "other schedule's run must not match")
+
+	// Filter by a list of schedule names matches runs from both.
+	runsBoth, err := ListWorkflows(dbosCtx, WithFilterScheduleName("trigger-schedule", "trigger-schedule-b"))
+	require.NoError(t, err)
+	idsBoth := make(map[string]bool, len(runsBoth))
+	for _, wf := range runsBoth {
+		require.Contains(t, []string{"trigger-schedule", "trigger-schedule-b"}, wf.ScheduleName)
+		idsBoth[wf.ID] = true
+	}
+	require.True(t, idsBoth[workflowID])
+	require.True(t, idsBoth[handleB.GetWorkflowID()])
+
+	// A schedule name that produced no runs returns nothing.
+	neverFired, err := ListWorkflows(dbosCtx, WithFilterScheduleName("never-fired"))
+	require.NoError(t, err)
+	require.Empty(t, neverFired)
 }
 
 func TestScheduleWithOptions(t *testing.T) {
@@ -786,4 +828,94 @@ func TestScheduleCronTimezone(t *testing.T) {
 	require.Equal(t, 2025, next.Year())
 	require.Equal(t, time.January, next.Month())
 	require.Equal(t, 15, next.Day())
+}
+
+func TestScheduleNameSurvivesExportImport(t *testing.T) {
+	dbosCtx := setupDBOS(t, setupDBOSOptions{dropDB: true, checkLeaks: true, schedulerPollingInterval: 100 * time.Millisecond})
+	defer dbosCtx.Shutdown(10 * time.Second)
+
+	RegisterWorkflow(dbosCtx, testWorkflowForSchedule)
+	require.NoError(t, dbosCtx.Launch())
+
+	require.NoError(t, CreateSchedule(dbosCtx, testWorkflowForSchedule, CreateScheduleRequest{
+		ScheduleName: "export-test",
+		Schedule:     "0 0 0 * * *", // daily, won't fire during the test
+	}))
+	t.Cleanup(func() { _ = DeleteSchedule(dbosCtx, "export-test") })
+
+	handle, err := TriggerSchedule(dbosCtx, "export-test")
+	require.NoError(t, err)
+	_, err = handle.GetResult()
+	require.NoError(t, err)
+	workflowID := handle.GetWorkflowID()
+
+	original, err := ListWorkflows(dbosCtx, WithWorkflowIDs([]string{workflowID}))
+	require.NoError(t, err)
+	require.Len(t, original, 1)
+	require.Equal(t, "export-test", original[0].ScheduleName)
+
+	// Export, delete, then reimport: schedule_name must survive the round-trip.
+	sdb := dbosCtx.(*dbosContext).systemDB.(*sysDB)
+	exported, err := sdb.exportWorkflow(dbosCtx, workflowID, true)
+	require.NoError(t, err)
+	require.NoError(t, DeleteWorkflows(dbosCtx, []string{workflowID}))
+	gone, err := ListWorkflows(dbosCtx, WithWorkflowIDs([]string{workflowID}))
+	require.NoError(t, err)
+	require.Empty(t, gone)
+
+	require.NoError(t, sdb.importWorkflow(dbosCtx, exported))
+	imported, err := ListWorkflows(dbosCtx, WithWorkflowIDs([]string{workflowID}))
+	require.NoError(t, err)
+	require.Len(t, imported, 1)
+	require.Equal(t, "export-test", imported[0].ScheduleName)
+
+	// The reimported run is still found by the schedule name filter.
+	byName, err := ListWorkflows(dbosCtx, WithFilterScheduleName("export-test"))
+	require.NoError(t, err)
+	require.Len(t, byName, 1)
+	require.Equal(t, workflowID, byName[0].ID)
+}
+
+// A schedule can fire on an executor that does not have the target workflow
+// registered: the tick enqueues by name and name resolution happens at dequeue
+// time on a worker that has the function.
+func TestScheduleFiresWithoutLocalRegistration(t *testing.T) {
+	dbosCtx := setupDBOS(t, setupDBOSOptions{dropDB: true, checkLeaks: true, schedulerPollingInterval: 100 * time.Millisecond})
+	defer dbosCtx.Shutdown(10 * time.Second)
+	require.NoError(t, dbosCtx.Launch())
+
+	client, err := NewClient(context.Background(), ClientConfig{DatabaseURL: backendDatabaseURL(t)})
+	require.NoError(t, err)
+	t.Cleanup(func() { client.Shutdown(30 * time.Second) })
+
+	const scheduleName = "unregistered-workflow-schedule"
+	const workflowName = "workflowRegisteredOnAnotherWorker"
+	const queueName = "queue-listened-elsewhere"
+	require.NoError(t, client.CreateSchedule(ClientScheduleInput{
+		ScheduleName: scheduleName,
+		WorkflowName: workflowName,
+		Schedule:     "*/1 * * * * *",
+		QueueName:    queueName,
+	}))
+	t.Cleanup(func() { _ = client.DeleteSchedule(scheduleName) })
+
+	var enqueued WorkflowStatus
+	require.Eventually(t, func() bool {
+		wfs, err := ListWorkflows(dbosCtx, WithWorkflowIDPrefix("sched-"+scheduleName+"-"))
+		if err != nil || len(wfs) == 0 {
+			return false
+		}
+		enqueued = wfs[0]
+		return true
+	}, 15*time.Second, 100*time.Millisecond, "tick should enqueue even though the workflow is not registered locally")
+
+	require.Equal(t, workflowName, enqueued.Name)
+	require.Equal(t, queueName, enqueued.QueueName)
+	require.Equal(t, scheduleName, enqueued.ScheduleName)
+	require.Equal(t, WorkflowStatusEnqueued, enqueued.Status)
+
+	sched, err := client.GetSchedule(scheduleName)
+	require.NoError(t, err)
+	require.NotNil(t, sched)
+	require.NotNil(t, sched.LastFiredAt, "last_fired_at should be updated after the tick")
 }

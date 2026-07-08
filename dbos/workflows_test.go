@@ -8231,6 +8231,9 @@ func TestWorkflowAttributes(t *testing.T) {
 		require.NoError(t, err)
 		require.Len(t, childStatuses, 1)
 		assert.Nil(t, childStatuses[0].Attributes)
+		// Workflows not enqueued by a named schedule have no schedule name and
+		// are never returned by the schedule name filter.
+		assert.Empty(t, childStatuses[0].ScheduleName)
 
 		// Workflows started without the option have no attributes
 		plainHandle, err := RunWorkflow(dbosCtx, attrParentWorkflow, "")
@@ -8757,6 +8760,52 @@ func TestFork(t *testing.T) {
 			require.Equal(t, customID, forkedIDs[0])
 			require.NotEmpty(t, forkedIDs[1])
 			awaitForks(forkedIDs)
+		})
+
+		t.Run("PublicAPI", func(t *testing.T) {
+			// Exercise the public batch fork API end-to-end, including a custom
+			// forked ID, mixed start steps, and an auto-generated ID.
+			customID := "public-forked-" + uuid.NewString()
+			handles, err := ForkWorkflows[int](dbosCtx, ForkWorkflowsInput{
+				Workflows: []ForkWorkflowSpec{
+					{OriginalWorkflowID: originalIDs[0], ForkedWorkflowID: customID, StartStep: 2},
+					{OriginalWorkflowID: originalIDs[1], StartStep: 1},
+					{OriginalWorkflowID: originalIDs[2]},
+				},
+			})
+			require.NoError(t, err)
+			require.Len(t, handles, 3)
+			// Handles are returned in the same order as the input specs.
+			require.Equal(t, customID, handles[0].GetWorkflowID())
+			require.NotEmpty(t, handles[1].GetWorkflowID())
+
+			forkedIDs := make([]string, len(handles))
+			for i, h := range handles {
+				res, err := h.GetResult()
+				require.NoError(t, err)
+				require.Equal(t, 6, res)
+				forkedIDs[i] = h.GetWorkflowID()
+			}
+			awaitForks(forkedIDs)
+
+			t.Run("Validation", func(t *testing.T) {
+				_, err := ForkWorkflows[int](nil, ForkWorkflowsInput{})
+				require.ErrorContains(t, err, "ctx cannot be nil")
+
+				_, err = ForkWorkflows[int](dbosCtx, ForkWorkflowsInput{})
+				require.ErrorContains(t, err, "at least one workflow")
+
+				_, err = ForkWorkflows[int](dbosCtx, ForkWorkflowsInput{
+					Workflows: []ForkWorkflowSpec{{OriginalWorkflowID: ""}},
+				})
+				require.ErrorContains(t, err, "original workflow ID cannot be empty")
+
+				_, err = ForkWorkflows[int](dbosCtx, ForkWorkflowsInput{
+					Workflows:         []ForkWorkflowSpec{{OriginalWorkflowID: originalIDs[0]}},
+					QueuePartitionKey: "pk",
+				})
+				require.ErrorContains(t, err, "queue partition key requires a queue name")
+			})
 		})
 
 		t.Run("Validation", func(t *testing.T) {

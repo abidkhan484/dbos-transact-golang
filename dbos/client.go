@@ -40,9 +40,8 @@ type Client interface {
 	ResumeWorkflow(workflowID string, opts ...ResumeWorkflowOption) (WorkflowHandle[any], error)
 	ResumeWorkflows(workflowIDs []string, opts ...ResumeWorkflowOption) ([]WorkflowHandle[any], error)
 	ForkWorkflow(input ForkWorkflowInput) (WorkflowHandle[any], error)
-	GetWorkflowSteps(workflowID string) ([]StepInfo, error)
-	ClientListWorkflows(opts ...ListWorkflowsOption) ([]WorkflowStatus, error)
-	ClientGetWorkflowSteps(workflowID string, opts ...GetWorkflowStepsOption) ([]StepInfo, error)
+	ForkWorkflows(input ForkWorkflowsInput) ([]WorkflowHandle[any], error)
+	GetWorkflowSteps(workflowID string, opts ...GetWorkflowStepsOption) ([]StepInfo, error)
 	ClientReadStream(workflowID string, key string, opts ...ReadStreamOption) ([]any, bool, error)
 	ClientReadStreamAsync(workflowID string, key string) (<-chan StreamValue[any], error)
 
@@ -659,20 +658,32 @@ func ClientForkWorkflow[R any](c Client, input ForkWorkflowInput) (WorkflowHandl
 	return typedClientHandle[R](c, handle), nil
 }
 
-// GetWorkflowSteps retrieves the execution steps of a workflow.
-func (c *client) GetWorkflowSteps(workflowID string) ([]StepInfo, error) {
-	return c.dbosCtx.GetWorkflowSteps(c.dbosCtx, workflowID)
+// ForkWorkflows forks a batch of workflows in a single database round-trip.
+// The returned handles are in the same order as input.Workflows.
+func (c *client) ForkWorkflows(input ForkWorkflowsInput) ([]WorkflowHandle[any], error) {
+	return c.dbosCtx.ForkWorkflows(c.dbosCtx, input)
 }
 
-// ClientListWorkflows lists workflows. Input and output are NOT loaded or
-// decoded by default. Pass WithLoadInput(true) / WithLoadOutput(true) to opt in.
-func (c *client) ClientListWorkflows(opts ...ListWorkflowsOption) ([]WorkflowStatus, error) {
-	return c.dbosCtx.ListWorkflows(c.dbosCtx, opts...)
+// ClientForkWorkflows forks a batch of workflows and returns typed handles whose
+// GetResult decodes each forked workflow's output into type R.
+func ClientForkWorkflows[R any](c Client, input ForkWorkflowsInput) ([]WorkflowHandle[R], error) {
+	if c == nil {
+		return nil, errors.New("client cannot be nil")
+	}
+	handles, err := c.ForkWorkflows(input)
+	if err != nil {
+		return nil, err
+	}
+	typedHandles := make([]WorkflowHandle[R], len(handles))
+	for i, handle := range handles {
+		typedHandles[i] = typedClientHandle[R](c, handle)
+	}
+	return typedHandles, nil
 }
 
-// ClientGetWorkflowSteps retrieves a workflow's execution steps. Step output is
+// GetWorkflowSteps retrieves a workflow's execution steps. Step output is
 // NOT loaded or decoded by default. Pass WithStepsLoadOutput(true) to opt in.
-func (c *client) ClientGetWorkflowSteps(workflowID string, opts ...GetWorkflowStepsOption) ([]StepInfo, error) {
+func (c *client) GetWorkflowSteps(workflowID string, opts ...GetWorkflowStepsOption) ([]StepInfo, error) {
 	return c.dbosCtx.GetWorkflowSteps(c.dbosCtx, workflowID, opts...)
 }
 
