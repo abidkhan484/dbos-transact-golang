@@ -32,6 +32,9 @@ type SystemDatabase interface {
 	Launch(ctx context.Context)
 	Pool() Pool
 	Dialect() Dialect
+	// IsContentionError reports whether err is a lock/serialization contention
+	// error for the active backend. See Dialect.IsContentionError.
+	IsContentionError(err error) bool
 	Shutdown(ctx context.Context, timeout time.Duration)
 	ResetSystemDB(ctx context.Context) error
 
@@ -901,6 +904,10 @@ func (s *SysDB) Pool() Pool {
 
 func (s *SysDB) Dialect() Dialect {
 	return s.dialect
+}
+
+func (s *SysDB) IsContentionError(err error) bool {
+	return s.dialect.IsContentionError(err)
 }
 
 func (s *SysDB) StreamWakeChannel(workflowID, key string) (chan struct{}, func()) {
@@ -2295,8 +2302,8 @@ func (s *SysDB) ForkWorkflows(ctx context.Context, input ForkWorkflowsDBInput) (
 		mapping := "(" + strings.Join(mappingBranches, " UNION ALL ") + ") AS m"
 
 		copyOutputsQuery := s.RenderSQL(`INSERT INTO %soperation_outputs
-			(workflow_uuid, function_id, output, error, function_name, child_workflow_id, started_at_epoch_ms, completed_at_epoch_ms)
-			SELECT m.fork_id, oo.function_id, oo.output, oo.error, oo.function_name, oo.child_workflow_id, oo.started_at_epoch_ms, oo.completed_at_epoch_ms
+			(workflow_uuid, function_id, output, error, function_name, child_workflow_id, started_at_epoch_ms, completed_at_epoch_ms, serialization)
+			SELECT m.fork_id, oo.function_id, oo.output, oo.error, oo.function_name, oo.child_workflow_id, oo.started_at_epoch_ms, oo.completed_at_epoch_ms, oo.serialization
 			FROM `+mapping+`
 			JOIN %soperation_outputs oo ON oo.workflow_uuid = m.orig_id AND oo.function_id < m.start_step`,
 			s.dialect.SchemaPrefix(s.schema), s.dialect.SchemaPrefix(s.schema))
@@ -2305,8 +2312,8 @@ func (s *SysDB) ForkWorkflows(ctx context.Context, input ForkWorkflowsDBInput) (
 		}
 
 		copyEventsHistoryQuery := s.RenderSQL(`INSERT INTO %sworkflow_events_history
-			(workflow_uuid, function_id, key, value)
-			SELECT m.fork_id, h.function_id, h.key, h.value
+			(workflow_uuid, function_id, key, value, serialization)
+			SELECT m.fork_id, h.function_id, h.key, h.value, h.serialization
 			FROM `+mapping+`
 			JOIN %sworkflow_events_history h ON h.workflow_uuid = m.orig_id AND h.function_id < m.start_step`,
 			s.dialect.SchemaPrefix(s.schema), s.dialect.SchemaPrefix(s.schema))
@@ -2315,9 +2322,9 @@ func (s *SysDB) ForkWorkflows(ctx context.Context, input ForkWorkflowsDBInput) (
 		}
 
 		// Copy only the latest version of each event (highest function_id per key) into workflow_events.
-		copyLatestEventsQuery := s.RenderSQL(`INSERT INTO %sworkflow_events (workflow_uuid, key, value)
-			SELECT workflow_uuid, key, value FROM (
-				SELECT m.fork_id AS workflow_uuid, h.key AS key, h.value AS value,
+		copyLatestEventsQuery := s.RenderSQL(`INSERT INTO %sworkflow_events (workflow_uuid, key, value, serialization)
+			SELECT workflow_uuid, key, value, serialization FROM (
+				SELECT m.fork_id AS workflow_uuid, h.key AS key, h.value AS value, h.serialization AS serialization,
 					ROW_NUMBER() OVER (PARTITION BY m.fork_id, h.key ORDER BY h.function_id DESC) AS rn
 				FROM `+mapping+`
 				JOIN %sworkflow_events_history h ON h.workflow_uuid = m.orig_id AND h.function_id < m.start_step
@@ -2328,8 +2335,8 @@ func (s *SysDB) ForkWorkflows(ctx context.Context, input ForkWorkflowsDBInput) (
 		}
 
 		copyStreamsQuery := s.RenderSQL(`INSERT INTO %sstreams
-			(workflow_uuid, key, value, "offset", function_id)
-			SELECT m.fork_id, st.key, st.value, st."offset", st.function_id
+			(workflow_uuid, key, value, "offset", function_id, serialization)
+			SELECT m.fork_id, st.key, st.value, st."offset", st.function_id, st.serialization
 			FROM `+mapping+`
 			JOIN %sstreams st ON st.workflow_uuid = m.orig_id AND st.function_id < m.start_step`,
 			s.dialect.SchemaPrefix(s.schema), s.dialect.SchemaPrefix(s.schema))
@@ -5797,7 +5804,7 @@ func (s *SysDB) ExportWorkflow(ctx context.Context, workflowID string, exportChi
 
 		// Export operation_outputs
 		outputsQuery := s.RenderSQL(`SELECT workflow_uuid, function_id, function_name, output, error,
-				child_workflow_id, started_at_epoch_ms, completed_at_epoch_ms
+				child_workflow_id, started_at_epoch_ms, completed_at_epoch_ms, serialization
 			FROM %soperation_outputs WHERE workflow_uuid = $1`, s.dialect.SchemaPrefix(s.schema))
 
 		outputRows, err := tx.Query(ctx, outputsQuery, wfID)
@@ -5810,7 +5817,8 @@ func (s *SysDB) ExportWorkflow(ctx context.Context, workflowID string, exportChi
 			var opFuncID *int
 			var opOutput, opError, opChildWfID *string
 			var opStartedAt, opCompletedAt *int64
-			if err := outputRows.Scan(&opWfUUID, &opFuncID, &opFuncName, &opOutput, &opError, &opChildWfID, &opStartedAt, &opCompletedAt); err != nil {
+			var opSerialization *string
+			if err := outputRows.Scan(&opWfUUID, &opFuncID, &opFuncName, &opOutput, &opError, &opChildWfID, &opStartedAt, &opCompletedAt, &opSerialization); err != nil {
 				scanErr := fmt.Errorf("failed to scan operation_outputs row for %s: %w", wfID, err)
 				if cerr := outputRows.Close(); cerr != nil {
 					return nil, errors.Join(scanErr, fmt.Errorf("close operation_outputs rows: %w", cerr))
@@ -5826,6 +5834,7 @@ func (s *SysDB) ExportWorkflow(ctx context.Context, workflowID string, exportChi
 				"child_workflow_id":     opChildWfID,
 				"started_at_epoch_ms":   opStartedAt,
 				"completed_at_epoch_ms": opCompletedAt,
+				"serialization":         opSerialization,
 			})
 		}
 		if cerr := outputRows.Close(); cerr != nil {
@@ -5836,7 +5845,7 @@ func (s *SysDB) ExportWorkflow(ctx context.Context, workflowID string, exportChi
 		}
 
 		// Export workflow_events
-		eventsQuery := s.RenderSQL(`SELECT workflow_uuid, key, value
+		eventsQuery := s.RenderSQL(`SELECT workflow_uuid, key, value, serialization
 			FROM %sworkflow_events WHERE workflow_uuid = $1`, s.dialect.SchemaPrefix(s.schema))
 
 		eventRows, err := tx.Query(ctx, eventsQuery, wfID)
@@ -5845,8 +5854,8 @@ func (s *SysDB) ExportWorkflow(ctx context.Context, workflowID string, exportChi
 		}
 		var workflowEvents []map[string]any
 		for eventRows.Next() {
-			var evWfUUID, evKey, evValue *string
-			if err := eventRows.Scan(&evWfUUID, &evKey, &evValue); err != nil {
+			var evWfUUID, evKey, evValue, evSerialization *string
+			if err := eventRows.Scan(&evWfUUID, &evKey, &evValue, &evSerialization); err != nil {
 				scanErr := fmt.Errorf("failed to scan workflow_events row for %s: %w", wfID, err)
 				if cerr := eventRows.Close(); cerr != nil {
 					return nil, errors.Join(scanErr, fmt.Errorf("close workflow_events rows: %w", cerr))
@@ -5857,6 +5866,7 @@ func (s *SysDB) ExportWorkflow(ctx context.Context, workflowID string, exportChi
 				"workflow_uuid": evWfUUID,
 				"key":           evKey,
 				"value":         evValue,
+				"serialization": evSerialization,
 			})
 		}
 		if cerr := eventRows.Close(); cerr != nil {
@@ -5867,7 +5877,7 @@ func (s *SysDB) ExportWorkflow(ctx context.Context, workflowID string, exportChi
 		}
 
 		// Export workflow_events_history
-		historyQuery := s.RenderSQL(`SELECT workflow_uuid, function_id, key, value
+		historyQuery := s.RenderSQL(`SELECT workflow_uuid, function_id, key, value, serialization
 			FROM %sworkflow_events_history WHERE workflow_uuid = $1`, s.dialect.SchemaPrefix(s.schema))
 
 		historyRows, err := tx.Query(ctx, historyQuery, wfID)
@@ -5876,9 +5886,9 @@ func (s *SysDB) ExportWorkflow(ctx context.Context, workflowID string, exportChi
 		}
 		var workflowEventsHistory []map[string]any
 		for historyRows.Next() {
-			var hWfUUID, hKey, hValue *string
+			var hWfUUID, hKey, hValue, hSerialization *string
 			var hFuncID *int
-			if err := historyRows.Scan(&hWfUUID, &hFuncID, &hKey, &hValue); err != nil {
+			if err := historyRows.Scan(&hWfUUID, &hFuncID, &hKey, &hValue, &hSerialization); err != nil {
 				scanErr := fmt.Errorf("failed to scan workflow_events_history row for %s: %w", wfID, err)
 				if cerr := historyRows.Close(); cerr != nil {
 					return nil, errors.Join(scanErr, fmt.Errorf("close workflow_events_history rows: %w", cerr))
@@ -5890,6 +5900,7 @@ func (s *SysDB) ExportWorkflow(ctx context.Context, workflowID string, exportChi
 				"function_id":   hFuncID,
 				"key":           hKey,
 				"value":         hValue,
+				"serialization": hSerialization,
 			})
 		}
 		if cerr := historyRows.Close(); cerr != nil {
@@ -5900,7 +5911,7 @@ func (s *SysDB) ExportWorkflow(ctx context.Context, workflowID string, exportChi
 		}
 
 		// Export streams
-		streamsQuery := s.RenderSQL(`SELECT workflow_uuid, key, value, "offset", function_id
+		streamsQuery := s.RenderSQL(`SELECT workflow_uuid, key, value, "offset", function_id, serialization
 			FROM %sstreams WHERE workflow_uuid = $1`, s.dialect.SchemaPrefix(s.schema))
 
 		streamRows, err := tx.Query(ctx, streamsQuery, wfID)
@@ -5909,9 +5920,9 @@ func (s *SysDB) ExportWorkflow(ctx context.Context, workflowID string, exportChi
 		}
 		var streams []map[string]any
 		for streamRows.Next() {
-			var sWfUUID, sKey, sValue *string
+			var sWfUUID, sKey, sValue, sSerialization *string
 			var sOffset, sFuncID *int
-			if err := streamRows.Scan(&sWfUUID, &sKey, &sValue, &sOffset, &sFuncID); err != nil {
+			if err := streamRows.Scan(&sWfUUID, &sKey, &sValue, &sOffset, &sFuncID, &sSerialization); err != nil {
 				scanErr := fmt.Errorf("failed to scan streams row for %s: %w", wfID, err)
 				if cerr := streamRows.Close(); cerr != nil {
 					return nil, errors.Join(scanErr, fmt.Errorf("close streams rows: %w", cerr))
@@ -5924,6 +5935,7 @@ func (s *SysDB) ExportWorkflow(ctx context.Context, workflowID string, exportChi
 				"value":         sValue,
 				"offset":        sOffset,
 				"function_id":   sFuncID,
+				"serialization": sSerialization,
 			})
 		}
 		if cerr := streamRows.Close(); cerr != nil {
@@ -6007,14 +6019,14 @@ func (s *SysDB) ImportWorkflow(ctx context.Context, workflows []ExportedWorkflow
 		for _, op := range wf.OperationOutputs {
 			insertOpQuery := s.RenderSQL(`INSERT INTO %soperation_outputs (
 					workflow_uuid, function_id, function_name, output, error,
-					child_workflow_id, started_at_epoch_ms, completed_at_epoch_ms
-				) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+					child_workflow_id, started_at_epoch_ms, completed_at_epoch_ms, serialization
+				) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
 				s.dialect.SchemaPrefix(s.schema))
 
 			_, err := tx.Exec(ctx, insertOpQuery,
 				op["workflow_uuid"], op["function_id"], op["function_name"],
 				op["output"], op["error"], op["child_workflow_id"],
-				op["started_at_epoch_ms"], op["completed_at_epoch_ms"],
+				op["started_at_epoch_ms"], op["completed_at_epoch_ms"], op["serialization"],
 			)
 			if err != nil {
 				return fmt.Errorf("failed to import operation_outputs: %w", err)
@@ -6024,12 +6036,12 @@ func (s *SysDB) ImportWorkflow(ctx context.Context, workflows []ExportedWorkflow
 		// Import workflow_events
 		for _, ev := range wf.WorkflowEvents {
 			insertEvQuery := s.RenderSQL(`INSERT INTO %sworkflow_events (
-					workflow_uuid, key, value
-				) VALUES ($1, $2, $3)`,
+					workflow_uuid, key, value, serialization
+				) VALUES ($1, $2, $3, $4)`,
 				s.dialect.SchemaPrefix(s.schema))
 
 			_, err := tx.Exec(ctx, insertEvQuery,
-				ev["workflow_uuid"], ev["key"], ev["value"],
+				ev["workflow_uuid"], ev["key"], ev["value"], ev["serialization"],
 			)
 			if err != nil {
 				return fmt.Errorf("failed to import workflow_events: %w", err)
@@ -6039,12 +6051,12 @@ func (s *SysDB) ImportWorkflow(ctx context.Context, workflows []ExportedWorkflow
 		// Import workflow_events_history
 		for _, h := range wf.WorkflowEventsHistory {
 			insertHistQuery := s.RenderSQL(`INSERT INTO %sworkflow_events_history (
-					workflow_uuid, function_id, key, value
-				) VALUES ($1, $2, $3, $4)`,
+					workflow_uuid, function_id, key, value, serialization
+				) VALUES ($1, $2, $3, $4, $5)`,
 				s.dialect.SchemaPrefix(s.schema))
 
 			_, err := tx.Exec(ctx, insertHistQuery,
-				h["workflow_uuid"], h["function_id"], h["key"], h["value"],
+				h["workflow_uuid"], h["function_id"], h["key"], h["value"], h["serialization"],
 			)
 			if err != nil {
 				return fmt.Errorf("failed to import workflow_events_history: %w", err)
@@ -6054,12 +6066,12 @@ func (s *SysDB) ImportWorkflow(ctx context.Context, workflows []ExportedWorkflow
 		// Import streams
 		for _, st := range wf.Streams {
 			insertStreamQuery := s.RenderSQL(`INSERT INTO %sstreams (
-					workflow_uuid, key, value, "offset", function_id
-				) VALUES ($1, $2, $3, $4, $5)`,
+					workflow_uuid, key, value, "offset", function_id, serialization
+				) VALUES ($1, $2, $3, $4, $5, $6)`,
 				s.dialect.SchemaPrefix(s.schema))
 
 			_, err := tx.Exec(ctx, insertStreamQuery,
-				st["workflow_uuid"], st["key"], st["value"], st["offset"], st["function_id"],
+				st["workflow_uuid"], st["key"], st["value"], st["offset"], st["function_id"], st["serialization"],
 			)
 			if err != nil {
 				return fmt.Errorf("failed to import streams: %w", err)
