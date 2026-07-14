@@ -17,6 +17,9 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/dbos-inc/dbos-transact-golang/dbos/internal/models"
+	"github.com/dbos-inc/dbos-transact-golang/dbos/internal/sysdb"
+
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/robfig/cron/v3"
@@ -61,7 +64,7 @@ func processConfig(inputConfig *Config) (*Config, error) {
 		return nil, fmt.Errorf("missing required config field: appName")
 	}
 	if inputConfig.SystemDBPool == nil && inputConfig.SqliteSystemDB == nil {
-		if _, err := detectDialect(inputConfig.DatabaseURL); err != nil {
+		if _, err := sysdb.DetectDialect(inputConfig.DatabaseURL); err != nil {
 			return nil, err
 		}
 	}
@@ -127,7 +130,7 @@ func processConfig(inputConfig *Config) (*Config, error) {
 }
 
 // AlertHandler is a function that handles alerts received from DBOS Conductor.
-type AlertHandler func(name string, message string, metadata map[string]string)
+type AlertHandler = models.AlertHandler
 
 // DBOSContext represents a DBOS execution context that provides workflow orchestration capabilities.
 // It extends the standard Go context.Context and adds methods for running workflows and steps,
@@ -227,7 +230,7 @@ type dbosContext struct {
 
 	launched atomic.Bool
 
-	systemDB    systemDatabase
+	systemDB    sysdb.SystemDatabase
 	adminServer *adminServer
 	config      *Config
 
@@ -301,7 +304,7 @@ func (c *dbosContext) ClearRegistries() {
 	c.workflowRegistry.Clear()
 	c.workflowCustomNametoFQN.Clear()
 	for name := range c.queueRunner.workflowQueueRegistry {
-		if name != _DBOS_INTERNAL_QUEUE_NAME {
+		if name != models.InternalQueueName {
 			delete(c.queueRunner.workflowQueueRegistry, name)
 		}
 	}
@@ -601,7 +604,7 @@ func NewDBOSContext(ctx context.Context, inputConfig Config) (DBOSContext, error
 	// Load and process the configuration
 	config, err := processConfig(&inputConfig)
 	if err != nil {
-		return nil, newInitializationError(err.Error())
+		return nil, models.NewInitializationError(err.Error())
 	}
 	initExecutor.config = config
 
@@ -616,27 +619,35 @@ func NewDBOSContext(ctx context.Context, inputConfig Config) (DBOSContext, error
 	initExecutor.applicationID = os.Getenv("DBOS__APPID")
 	initExecutor.serializer = config.Serializer
 
-	newSystemDatabaseInputs := newSystemDatabaseInput{
-		databaseURL:     config.DatabaseURL,
-		databaseSchema:  config.DatabaseSchema,
-		customPool:      config.SystemDBPool,
-		customSqliteDB:  config.SqliteSystemDB,
-		logger:          initExecutor.logger,
-		applicationName: config.AppName,
+	newSystemDatabaseInputs := sysdb.NewSystemDatabaseInput{
+		DatabaseURL:     config.DatabaseURL,
+		DatabaseSchema:  config.DatabaseSchema,
+		CustomPool:      config.SystemDBPool,
+		CustomSqliteDB:  config.SqliteSystemDB,
+		Logger:          initExecutor.logger,
+		ApplicationName: config.AppName,
+		EncodeScheduledInput: func(ctx context.Context, scheduledTime time.Time, scheduleContext any) (*string, string, error) {
+			ser := resolveEncoder(ctx)
+			encoded, err := ser.Encode(ScheduledWorkflowInput{
+				ScheduledTime: scheduledTime,
+				Context:       scheduleContext,
+			})
+			return encoded, ser.Name(), err
+		},
 	}
 
 	// Create the system database
-	systemDB, err := newSystemDatabase(initExecutor, newSystemDatabaseInputs)
+	systemDB, err := sysdb.NewSystemDatabase(initExecutor, newSystemDatabaseInputs)
 	if err != nil {
 		initExecutor.logger.Error("failed to create system database", "error", err)
-		return nil, newInitializationError(err.Error())
+		return nil, models.NewInitializationError(err.Error())
 	}
 	initExecutor.systemDB = systemDB
 	initExecutor.logger.Debug("System database initialized")
 
 	// Initialize the queue runner and register DBOS internal queue
 	initExecutor.queueRunner = newQueueRunner(initExecutor.logger)
-	NewWorkflowQueue(initExecutor, _DBOS_INTERNAL_QUEUE_NAME)
+	NewWorkflowQueue(initExecutor, models.InternalQueueName)
 
 	// Register the any,any internal debouncer workflow so it's always available for execution
 	// This allows a client to debounce workflow and the server side to run them, even without knowing the actual workflow types
@@ -678,7 +689,7 @@ func NewDBOSContext(ctx context.Context, inputConfig Config) (DBOSContext, error
 	if conductorCfg != nil {
 		conductor, err := newConductor(initExecutor, *conductorCfg)
 		if err != nil {
-			return nil, newInitializationError(fmt.Sprintf("failed to initialize conductor: %v", err))
+			return nil, models.NewInitializationError(fmt.Sprintf("failed to initialize conductor: %v", err))
 		}
 		initExecutor.conductor = conductor
 		initExecutor.logger.Debug("Conductor initialized")
@@ -694,20 +705,20 @@ func NewDBOSContext(ctx context.Context, inputConfig Config) (DBOSContext, error
 // Returns an error if the context is already launched or if any component fails to start.
 func (c *dbosContext) Launch() error {
 	if c.launched.Load() {
-		return newInitializationError("DBOS is already launched")
+		return models.NewInitializationError("DBOS is already launched")
 	}
 
 	// Start the system database
-	c.systemDB.launch(c)
+	c.systemDB.Launch(c)
 
 	// Register the current application version and warn if it is not the latest.
-	if err := retry(c, func() error {
-		return c.systemDB.createApplicationVersion(c, c.applicationVersion)
-	}, withRetrierLogger(c.logger)); err != nil {
+	if err := sysdb.Retry(c, func() error {
+		return c.systemDB.CreateApplicationVersion(c, c.applicationVersion)
+	}, sysdb.WithRetrierLogger(c.logger)); err != nil {
 		c.logger.Warn("Failed to register application version", "version", c.applicationVersion, "error", err)
-	} else if latest, err := retryWithResult(c, func() (*VersionInfo, error) {
-		return c.systemDB.getLatestApplicationVersion(c, nil)
-	}, withRetrierLogger(c.logger)); err != nil {
+	} else if latest, err := sysdb.RetryWithResult(c, func() (*VersionInfo, error) {
+		return c.systemDB.GetLatestApplicationVersion(c, nil)
+	}, sysdb.WithRetrierLogger(c.logger)); err != nil {
 		c.logger.Warn("Failed to fetch latest application version", "error", err)
 	} else if latest.Name != c.applicationVersion {
 		c.logger.Warn("Current application version is not the latest",
@@ -720,7 +731,7 @@ func (c *dbosContext) Launch() error {
 		err := adminServer.Start()
 		if err != nil {
 			c.logger.Error("Failed to start admin server", "error", err)
-			return newInitializationError(fmt.Sprintf("failed to start admin server: %v", err))
+			return models.NewInitializationError(fmt.Sprintf("failed to start admin server: %v", err))
 		}
 		c.logger.Debug("Admin server started", "port", c.config.AdminServerPort)
 		c.adminServer = adminServer
@@ -749,7 +760,7 @@ func (c *dbosContext) Launch() error {
 	// Run a round of recovery on the local executor
 	recoveryHandles, err := recoverPendingWorkflows(c, []string{c.executorID})
 	if err != nil {
-		return newInitializationError(fmt.Sprintf("failed to recover pending workflows during launch: %v", err))
+		return models.NewInitializationError(fmt.Sprintf("failed to recover pending workflows during launch: %v", err))
 	}
 	if len(recoveryHandles) > 0 {
 		c.logger.Info("Recovered pending workflows", "count", len(recoveryHandles))
@@ -846,7 +857,7 @@ func (c *dbosContext) Shutdown(timeout time.Duration) {
 	// Close the system database
 	if c.systemDB != nil {
 		c.logger.Debug("Shutting down system database")
-		c.systemDB.shutdown(c, timeout)
+		c.systemDB.Shutdown(c, timeout)
 	}
 
 	c.launched.Store(false)
