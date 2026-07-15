@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"reflect"
 	"time"
 )
@@ -352,7 +353,7 @@ func init() {
 //   - All other (Go <-> Go) workflows gob-encode the error so its concrete Go type
 //     (e.g. *DBOSError) is preserved and reconstructed as-is on decode. Errors whose type
 //     cannot be gob-encoded (e.g. errors.New/fmt.Errorf) fall back to their plain string.
-func serializeWorkflowError(err error, serialization string) string {
+func serializeWorkflowError(logger *slog.Logger, err error, serialization string) string {
 	if err == nil {
 		return ""
 	}
@@ -361,6 +362,9 @@ func serializeWorkflowError(err error, serialization string) string {
 		// Types that cannot be gob-encoded (e.g. errors.New/fmt.Errorf) fall back to their string.
 		if encoded, gobErr := NewGobSerializer().Encode(err); gobErr == nil && encoded != nil {
 			return *encoded
+		} else if logger != nil {
+			logger.Warn("workflow error type cannot be gob-encoded; persisting its message only: errors.Is/errors.As will not match this error when read back from the database",
+				"error_type", fmt.Sprintf("%T", err), "error", err, "encode_error", gobErr)
 		}
 		return err.Error()
 	}

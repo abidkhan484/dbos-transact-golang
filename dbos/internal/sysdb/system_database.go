@@ -1965,7 +1965,7 @@ func (s *SysDB) GarbageCollectWorkflows(ctx context.Context, input GarbageCollec
 			return fmt.Errorf("failed to query cutoff timestamp by rows threshold: %w", err)
 		}
 		// If we don't have a provided cutoffTimestamp and found one in the database
-		// Or if the found cutoffTimestamp is more restrictive (higher timestamp = more recent = less deletion)
+		// Or if the found cutoffTimestamp deletes more (higher timestamp = more recent cutoff = more rows deleted), as needed to enforce the rows threshold
 		// Use the cutoff timestamp found in the database
 		if rowsBasedCutoff > 0 && cutoffTimestamp == nil || (cutoffTimestamp != nil && rowsBasedCutoff > *cutoffTimestamp) {
 			cutoffTimestamp = &rowsBasedCutoff
@@ -4569,6 +4569,9 @@ func (s *SysDB) GetQueuePartitions(ctx context.Context, queueName string) ([]str
 		}
 		partitions = append(partitions, partitionKey)
 	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("failed to read queue partitions: %w", err)
+	}
 
 	return partitions, nil
 }
@@ -5131,13 +5134,15 @@ func (s *SysDB) ListSchedules(ctx context.Context, input ListSchedulesDBInput) (
 
 		if lastFiredAtStr != nil {
 			t, err := time.Parse(time.RFC3339Nano, *lastFiredAtStr)
+			if err != nil {
+				t, err = time.Parse(time.RFC3339, *lastFiredAtStr)
+			}
 			if err == nil {
 				schedule.LastFiredAt = &t
 			} else {
-				t, err = time.Parse(time.RFC3339, *lastFiredAtStr)
-				if err == nil {
-					schedule.LastFiredAt = &t
-				}
+				// A nil LastFiredAt disables automatic backfill for this schedule
+				s.logger.Warn("failed to parse schedule last_fired_at; automatic backfill will not run for this schedule",
+					"schedule_name", schedule.ScheduleName, "last_fired_at", *lastFiredAtStr, "error", err)
 			}
 		}
 		if err := json.Unmarshal([]byte(contextJSON), &schedule.Context); err != nil {
@@ -5145,6 +5150,9 @@ func (s *SysDB) ListSchedules(ctx context.Context, input ListSchedulesDBInput) (
 		}
 
 		schedules = append(schedules, schedule)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("failed to list schedules: %w", err)
 	}
 
 	return schedules, nil

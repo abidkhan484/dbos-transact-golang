@@ -121,8 +121,8 @@ func (h *baseWorkflowHandle) GetStatus() (WorkflowStatus, error) {
 	loadInput := false
 	loadOutput := false
 	if h.dbosContext.(*dbosContext).launched.Load() {
-		loadInput = false
-		loadOutput = false
+		loadInput = true
+		loadOutput = true
 	}
 	c := h.dbosContext.(*dbosContext)
 	workflowState, ok := c.Value(workflowStateKey).(*workflowState)
@@ -153,6 +153,9 @@ func (h *baseWorkflowHandle) GetStatus() (WorkflowStatus, error) {
 	}
 	if len(workflowStatuses) == 0 {
 		return WorkflowStatus{}, models.NewNonExistentWorkflowError(h.workflowID)
+	}
+	if err := c.decodeWorkflowsInputOutput(workflowStatuses, loadInput, loadOutput); err != nil {
+		return WorkflowStatus{}, fmt.Errorf("failed to get workflow status: %w", err)
 	}
 	return workflowStatuses[0], nil
 }
@@ -288,7 +291,7 @@ func (h *workflowHandle[R]) processOutcome(outcome workflowOutcome[R], startTime
 		}
 		var serializedOutcomeErr *string
 		if outcome.err != nil {
-			s := serializeWorkflowError(outcome.err, ser.Name())
+			s := serializeWorkflowError(h.dbosContext.(*dbosContext).logger, outcome.err, ser.Name())
 			serializedOutcomeErr = &s
 		}
 		recordGetResultInput := sysdb.RecordOperationResultDBInput{
@@ -401,7 +404,7 @@ func (h *workflowPollingHandle[R]) GetResult(opts ...GetResultOption) (R, error)
 		serialization := storedSerialization
 		if childCancelled {
 			serialization = resolveEncoder(h.dbosContext).Name()
-			serializedErr := serializeWorkflowError(awaitErr, serialization)
+			serializedErr := serializeWorkflowError(h.dbosContext.(*dbosContext).logger, awaitErr, serialization)
 			errStr = &serializedErr
 		}
 		recordGetResultInput := sysdb.RecordOperationResultDBInput{
@@ -1664,7 +1667,7 @@ func (c *dbosContext) RunWorkflow(_ DBOSContext, fn WorkflowFunc, input any, opt
 
 			var serializedErr string
 			if err != nil {
-				serializedErr = serializeWorkflowError(err, resolveEncoder(workflowCtx).Name())
+				serializedErr = serializeWorkflowError(c.logger, err, resolveEncoder(workflowCtx).Name())
 			}
 			// Remove from the active set before the outcome becomes durable: once it is
 			// visible, a resume→dequeue can re-dispatch this workflow to this executor,
@@ -1815,7 +1818,7 @@ func WithRetryPredicate(fn func(error) bool) StepOption {
 	}
 }
 
-func WithNextStepID(stepID int) StepOption {
+func withNextStepID(stepID int) StepOption {
 	return func(opts *stepOptions) {
 		opts.preGeneratedStepID = &stepID
 	}
@@ -2127,7 +2130,7 @@ func (c *dbosContext) RunAsStep(_ DBOSContext, fn StepFunc, opts ...StepOption) 
 	stepCompletedTime := time.Now()
 	var serializedStepErr *string
 	if stepError != nil {
-		s := serializeWorkflowError(stepError, ser.Name())
+		s := serializeWorkflowError(c.logger, stepError, ser.Name())
 		serializedStepErr = &s
 	}
 	dbInput := sysdb.RecordOperationResultDBInput{
@@ -2301,7 +2304,7 @@ func (c *dbosContext) runAsTxn(_ DBOSContext, fn TxnFunc, opts ...StepOption) (a
 
 		var serializedTxnErr *string
 		if stepError != nil {
-			s := serializeWorkflowError(stepError, txnSer.Name())
+			s := serializeWorkflowError(c.logger, stepError, txnSer.Name())
 			serializedTxnErr = &s
 		}
 		dbInput := sysdb.RecordOperationResultDBInput{
@@ -2405,7 +2408,7 @@ func (c *dbosContext) Go(ctx DBOSContext, fn StepFunc, opts ...StepOption) (chan
 	if !ok || wfState == nil {
 		return nil, models.NewStepExecutionError("", "", errors.New("workflow state not found in context: are you running this step within a workflow?"))
 	}
-	opts = append(opts, WithNextStepID(wfState.nextStepID()))
+	opts = append(opts, withNextStepID(wfState.nextStepID()))
 
 	// Run step inside a Go routine
 	result := make(chan StepOutcome[any], 1)
@@ -2710,7 +2713,7 @@ func (c *dbosContext) Recv(_ DBOSContext, topic string, timeout time.Duration) (
 		// re-execution the recorded deadline is returned, so only the remaining time is waited.
 		deadlineMs, err := runAsTxn(c, func(ctx context.Context, tx Tx) (int64, error) {
 			return time.Now().Add(timeout).UnixMilli(), nil
-		}, WithStepName("DBOS.sleep"), WithNextStepID(sleepStepID))
+		}, WithStepName("DBOS.sleep"), withNextStepID(sleepStepID))
 		if err != nil {
 			return nil, err
 		}
@@ -2738,7 +2741,7 @@ func (c *dbosContext) Recv(_ DBOSContext, topic string, timeout time.Duration) (
 			return output, models.NewTimeoutError(workflowID, "DBOS.recv", fmt.Sprintf("no message received within %v", timeout))
 		}
 		return output, nil
-	}, WithStepName("DBOS.recv"), WithNextStepID(stepID))
+	}, WithStepName("DBOS.recv"), withNextStepID(stepID))
 
 	switch v := out.(type) {
 	case rawStepOutput: // executed now
@@ -2942,7 +2945,7 @@ func (c *dbosContext) GetEvent(_ DBOSContext, targetWorkflowID, key string, time
 			// re-execution the recorded deadline is returned, so only the remaining time is waited.
 			deadlineMs, txErr := runAsTxn(c, func(ctx context.Context, tx Tx) (int64, error) {
 				return time.Now().Add(timeout).UnixMilli(), nil
-			}, WithStepName("DBOS.sleep"), WithNextStepID(sleepStepID))
+			}, WithStepName("DBOS.sleep"), withNextStepID(sleepStepID))
 			if txErr != nil {
 				return nil, txErr
 			}
@@ -2995,7 +2998,7 @@ func (c *dbosContext) GetEvent(_ DBOSContext, targetWorkflowID, key string, time
 			return output, models.NewTimeoutError(workflowID, "DBOS.getEvent", fmt.Sprintf("no event found for key '%s' within %v", key, timeout))
 		}
 		return output, nil
-	}, WithStepName("DBOS.getEvent"), WithNextStepID(stepID))
+	}, WithStepName("DBOS.getEvent"), withNextStepID(stepID))
 
 	switch v := out.(type) {
 	case rawStepOutput: // executed now
@@ -3761,13 +3764,6 @@ func GetStepID(ctx DBOSContext) (int, error) {
 }
 
 func (c *dbosContext) RetrieveWorkflow(_ DBOSContext, workflowID string) (WorkflowHandle[any], error) {
-	loadInput := false
-	loadOutput := false
-	if c.launched.Load() {
-		loadInput = false
-		loadOutput = false
-	}
-
 	workflowState, ok := c.Value(workflowStateKey).(*workflowState)
 	isWithinWorkflow := ok && workflowState != nil
 	var workflowStatus []WorkflowStatus
@@ -3777,8 +3773,8 @@ func (c *dbosContext) RetrieveWorkflow(_ DBOSContext, workflowID string) (Workfl
 			return sysdb.RetryWithResult(ctx, func() ([]WorkflowStatus, error) {
 				return c.systemDB.ListWorkflows(ctx, sysdb.ListWorkflowsDBInput{
 					WorkflowIDs: []string{workflowID},
-					LoadInput:   loadInput,
-					LoadOutput:  loadOutput,
+					LoadInput:   false,
+					LoadOutput:  false,
 				})
 			}, sysdb.WithRetrierLogger(c.logger))
 		}, WithStepName("DBOS.retrieveWorkflow"))
@@ -3786,8 +3782,8 @@ func (c *dbosContext) RetrieveWorkflow(_ DBOSContext, workflowID string) (Workfl
 		workflowStatus, err = sysdb.RetryWithResult(c, func() ([]WorkflowStatus, error) {
 			return c.systemDB.ListWorkflows(c, sysdb.ListWorkflowsDBInput{
 				WorkflowIDs: []string{workflowID},
-				LoadInput:   loadInput,
-				LoadOutput:  loadOutput,
+				LoadInput:   false,
+				LoadOutput:  false,
 			})
 		}, sysdb.WithRetrierLogger(c.logger))
 	}
@@ -4690,12 +4686,21 @@ func (c *dbosContext) ListWorkflows(_ DBOSContext, opts ...ListWorkflowsOption) 
 	}
 
 	// Deserialize Input and Output fields if they were loaded
-	if params.LoadInput || params.LoadOutput {
+	if err := c.decodeWorkflowsInputOutput(workflows, params.LoadInput, params.LoadOutput); err != nil {
+		return nil, err
+	}
+
+	return workflows, nil
+}
+
+// decodeWorkflowsInputOutput decodes the raw encoded input/output columns loaded from the system database.
+func (c *dbosContext) decodeWorkflowsInputOutput(workflows []WorkflowStatus, loadInput, loadOutput bool) error {
+	if loadInput || loadOutput {
 		for i := range workflows {
-			if params.LoadInput && workflows[i].Input != nil {
+			if loadInput && workflows[i].Input != nil {
 				encodedInput, ok := workflows[i].Input.(*string)
 				if !ok {
-					return nil, fmt.Errorf("workflow input must be encoded string, got %T", workflows[i].Input)
+					return fmt.Errorf("workflow input must be encoded string, got %T", workflows[i].Input)
 				}
 				if encodedInput == nil || *encodedInput == nilMarker {
 					workflows[i].Input = nil
@@ -4721,10 +4726,10 @@ func (c *dbosContext) ListWorkflows(_ DBOSContext, opts ...ListWorkflowsOption) 
 					}
 				}
 			}
-			if params.LoadOutput && workflows[i].Output != nil {
+			if loadOutput && workflows[i].Output != nil {
 				encodedOutput, ok := workflows[i].Output.(*string)
 				if !ok {
-					return nil, fmt.Errorf("workflow output must be encoded *string, got %T", workflows[i].Output)
+					return fmt.Errorf("workflow output must be encoded *string, got %T", workflows[i].Output)
 				}
 				if encodedOutput == nil || *encodedOutput == nilMarker {
 					workflows[i].Output = nil
@@ -4749,14 +4754,14 @@ func (c *dbosContext) ListWorkflows(_ DBOSContext, opts ...ListWorkflowsOption) 
 					}
 				}
 			}
-			if params.LoadOutput && workflows[i].Error != nil {
+			if loadOutput && workflows[i].Error != nil {
 				s := workflows[i].Error.Error()
 				workflows[i].Error = deserializeWorkflowError(&s)
 			}
 		}
 	}
 
-	return workflows, nil
+	return nil
 }
 
 // ListWorkflows retrieves a list of workflows based on the provided filters.
