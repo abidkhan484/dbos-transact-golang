@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -431,6 +432,232 @@ func TestConfig(t *testing.T) {
 		})
 	})
 
+}
+
+func TestSystemDBStartupTimeoutConfig(t *testing.T) {
+	t.Run("Default", func(t *testing.T) {
+		config, err := processConfig(&Config{AppName: "test", DatabaseURL: "sqlite::memory:"})
+		require.NoError(t, err)
+		assert.Equal(t, 2*time.Minute, config.SystemDBStartupTimeout)
+	})
+
+	t.Run("Explicit", func(t *testing.T) {
+		config, err := processConfig(&Config{
+			AppName:                "test",
+			DatabaseURL:            "sqlite::memory:",
+			SystemDBStartupTimeout: 17 * time.Second,
+		})
+		require.NoError(t, err)
+		assert.Equal(t, 17*time.Second, config.SystemDBStartupTimeout)
+	})
+
+	t.Run("Negative", func(t *testing.T) {
+		_, err := processConfig(&Config{
+			AppName:                "test",
+			DatabaseURL:            "sqlite::memory:",
+			SystemDBStartupTimeout: -time.Second,
+		})
+		require.EqualError(t, err, "systemDBStartupTimeout cannot be negative")
+	})
+}
+
+func TestSystemDBStartupTimeoutBoundsSQLitePoolWait(t *testing.T) {
+	db, err := sql.Open("sqlite", ":memory:")
+	require.NoError(t, err)
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+
+	conn, err := db.Conn(context.Background())
+	require.NoError(t, err)
+	defer conn.Close()
+
+	const timeout = 50 * time.Millisecond
+	started := time.Now()
+	_, err = NewDBOSContext(context.Background(), Config{
+		AppName:                "startup-timeout-sqlite",
+		SqliteSystemDB:         db,
+		SystemDBStartupTimeout: timeout,
+	})
+	elapsed := time.Since(started)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "system database startup timed out after 50ms while initializing the SQLite system database")
+	assert.Less(t, elapsed, time.Second)
+}
+
+func TestSystemDBStartupTimeoutDiagnosesExhaustedPostgresPool(t *testing.T) {
+	skipIfSqlite(t, "PostgreSQL pool statistics")
+	poolConfig, err := pgxpool.ParseConfig(backendDatabaseURL(t))
+	require.NoError(t, err)
+	poolConfig.MaxConns = 1
+	pool, err := pgxpool.NewWithConfig(context.Background(), poolConfig)
+	require.NoError(t, err)
+	defer pool.Close()
+
+	conn, err := pool.Acquire(context.Background())
+	require.NoError(t, err)
+	defer conn.Release()
+
+	_, err = NewDBOSContext(context.Background(), Config{
+		AppName:                "startup-timeout-exhausted-pool",
+		SystemDBPool:           pool,
+		SystemDBStartupTimeout: 50 * time.Millisecond,
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "while acquiring a connection from the custom pool: connection pool has no free connections (acquired=1, max=1)")
+}
+
+type launchRecoveryFaultPool struct {
+	sysdb.Pool
+}
+
+func (p *launchRecoveryFaultPool) Query(ctx context.Context, query string, args ...any) (sysdb.Rows, error) {
+	if strings.Contains(query, "SELECT workflow_uuid, status, name") {
+		return nil, errors.New("injected recovery failure")
+	}
+	return p.Pool.Query(ctx, query, args...)
+}
+
+func TestLaunchFailureCleansUpStartedComponents(t *testing.T) {
+	ctx, err := NewDBOSContext(context.Background(), Config{
+		AppName:     "test-launch-cleanup",
+		DatabaseURL: "sqlite:" + filepath.Join(t.TempDir(), "dbos.db"),
+	})
+	require.NoError(t, err)
+
+	dbosCtx := ctx.(*dbosContext)
+	systemDB := dbosCtx.systemDB.(*sysdb.SysDB)
+	systemDB.SetPool(&launchRecoveryFaultPool{Pool: systemDB.Pool()})
+
+	err = dbosCtx.Launch()
+	require.ErrorContains(t, err, "failed to recover pending workflows during launch")
+	require.ErrorContains(t, err, "injected recovery failure")
+
+	assert.False(t, dbosCtx.launched.Load())
+	assert.False(t, dbosCtx.queueRunnerStarted.Load())
+	assert.False(t, dbosCtx.workflowSchedulerStarted.Load())
+	assert.NotNil(t, dbosCtx.workflowScheduler)
+	assert.ErrorIs(t, dbosCtx.Err(), context.Canceled)
+	assert.False(t, systemDB.Launched())
+	require.Error(t, systemDB.Pool().Ping(context.Background()))
+}
+
+func TestConcurrentLaunchOnlyStartsOnce(t *testing.T) {
+	ctx, err := NewDBOSContext(context.Background(), Config{
+		AppName:     "test-concurrent-launch",
+		DatabaseURL: "sqlite:" + filepath.Join(t.TempDir(), "dbos.db"),
+	})
+	require.NoError(t, err)
+
+	start := make(chan struct{})
+	results := make(chan error, 2)
+	for range 2 {
+		go func() {
+			<-start
+			results <- Launch(ctx)
+		}()
+	}
+	close(start)
+
+	var successes int
+	for range 2 {
+		if err := <-results; err == nil {
+			successes++
+		} else {
+			assert.ErrorContains(t, err, "DBOS is already launched")
+		}
+	}
+	assert.Equal(t, 1, successes)
+	Shutdown(ctx, 5*time.Second)
+}
+
+func TestConcurrentShutdownDoesNotWaitTwice(t *testing.T) {
+	ctx, err := NewDBOSContext(context.Background(), Config{
+		AppName:     "test-concurrent-shutdown",
+		DatabaseURL: "sqlite:" + filepath.Join(t.TempDir(), "dbos.db"),
+	})
+	require.NoError(t, err)
+	dbosCtx := ctx.(*dbosContext)
+	// Simulate a queue runner that cannot complete so the first caller remains
+	// in Shutdown long enough for the second caller to enter.
+	dbosCtx.queueRunnerStarted.Store(true)
+
+	const timeout = 200 * time.Millisecond
+	start := make(chan struct{})
+	durations := make(chan time.Duration, 2)
+	var ready sync.WaitGroup
+	ready.Add(2)
+	for range 2 {
+		go func() {
+			ready.Done()
+			<-start
+			began := time.Now()
+			Shutdown(ctx, timeout)
+			durations <- time.Since(began)
+		}()
+	}
+	ready.Wait()
+	close(start)
+
+	first := <-durations
+	second := <-durations
+	assert.Less(t, min(first, second), timeout/2)
+}
+
+type blockingScheduleListDB struct {
+	sysdb.SystemDatabase
+	entered chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (s *blockingScheduleListDB) ListSchedules(context.Context, sysdb.ListSchedulesDBInput) ([]WorkflowSchedule, error) {
+	s.once.Do(func() { close(s.entered) })
+	<-s.release
+	return nil, nil
+}
+
+func TestShutdownJoinsScheduleReconciler(t *testing.T) {
+	ctx, err := NewDBOSContext(context.Background(), Config{
+		AppName:                  "test-reconciler-shutdown",
+		DatabaseURL:              "sqlite:" + filepath.Join(t.TempDir(), "dbos.db"),
+		SchedulerPollingInterval: time.Hour,
+	})
+	require.NoError(t, err)
+	dbosCtx := ctx.(*dbosContext)
+	blockingDB := &blockingScheduleListDB{
+		SystemDatabase: dbosCtx.systemDB,
+		entered:        make(chan struct{}),
+		release:        make(chan struct{}),
+	}
+	dbosCtx.systemDB = blockingDB
+	dbosCtx.workflowScheduler.Start()
+	dbosCtx.workflowSchedulerStarted.Store(true)
+	dbosCtx.scheduleReconcilerWg.Add(1)
+	go func() {
+		defer dbosCtx.scheduleReconcilerWg.Done()
+		dbosCtx.runScheduleReconciler()
+	}()
+	<-blockingDB.entered
+
+	shutdownDone := make(chan struct{})
+	go func() {
+		Shutdown(ctx, time.Second)
+		close(shutdownDone)
+	}()
+	select {
+	case <-shutdownDone:
+		t.Fatal("Shutdown returned before the schedule reconciler exited")
+	case <-time.After(50 * time.Millisecond):
+	}
+	assert.True(t, dbosCtx.workflowSchedulerStarted.Load())
+
+	close(blockingDB.release)
+	select {
+	case <-shutdownDone:
+	case <-time.After(time.Second):
+		t.Fatal("Shutdown did not complete after the schedule reconciler exited")
+	}
+	assert.False(t, dbosCtx.workflowSchedulerStarted.Load())
 }
 
 func TestContext(t *testing.T) {

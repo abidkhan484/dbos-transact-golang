@@ -145,10 +145,11 @@ type ExportedWorkflow struct {
 type SysDB struct {
 	pool                 Pool
 	dialect              Dialect
+	notificationLoopMu   sync.Mutex
 	notificationLoopDone chan struct{}
 	RecvNotifier         *notifyRegistry // recv waiters, keyed by "destinationID::topic"
 	EventNotifier        *notifyRegistry // getEvent waiters, keyed by "targetWorkflowID::key"
-	streamsMap           *sync.Map
+	streamNotifier       *notifyRegistry // stream readers, keyed by "workflowID::key"
 	logger               *slog.Logger
 	encodeScheduledInput func(ctx context.Context, scheduledTime time.Time, scheduleContext any) (*string, string, error)
 	schema               string
@@ -706,10 +707,25 @@ type NewSystemDatabaseInput struct {
 	CustomSqliteDB  *sql.DB
 	Logger          *slog.Logger
 	ApplicationName string
+	StartupTimeout  time.Duration
 	// EncodeScheduledInput serializes the input of a schedule-created workflow
 	// (backfill/trigger). Injected by the caller to keep serialization concerns
 	// out of the system database.
 	EncodeScheduledInput func(ctx context.Context, scheduledTime time.Time, scheduleContext any) (encoded *string, serialization string, err error)
+}
+
+func startupError(ctx context.Context, timeout time.Duration, phase string, pool *pgxpool.Pool, err error) error {
+	if !errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		return err
+	}
+	if pool != nil {
+		stat := pool.Stat()
+		if stat.MaxConns() > 0 && stat.AcquiredConns() >= stat.MaxConns() {
+			return fmt.Errorf("system database startup timed out after %s while %s: connection pool has no free connections (acquired=%d, max=%d); increase pool capacity or release checked-out connections: %w",
+				timeout, phase, stat.AcquiredConns(), stat.MaxConns(), context.DeadlineExceeded)
+		}
+	}
+	return fmt.Errorf("system database startup timed out after %s while %s; check database connectivity, pool capacity, and blocking database locks: %w", timeout, phase, context.DeadlineExceeded)
 }
 
 // RenderSQL formats a canonical pg-style query string with sprintf and runs
@@ -739,7 +755,11 @@ func NewSystemDatabase(ctx context.Context, inputs NewSystemDatabaseInput) (Syst
 
 	// Dispatch sqlite first
 	if customSqliteDB != nil {
-		return newSqliteSystemDatabase(inputs.EncodeScheduledInput, ctx, databaseURL, databaseSchema, customSqliteDB, logger)
+		systemDB, err := newSqliteSystemDatabase(inputs.EncodeScheduledInput, ctx, databaseURL, databaseSchema, customSqliteDB, logger)
+		if err != nil {
+			return nil, startupError(ctx, inputs.StartupTimeout, "initializing the SQLite system database", nil, err)
+		}
+		return systemDB, nil
 	}
 	if customPool == nil {
 		dialectName, err := DetectDialect(databaseURL)
@@ -747,7 +767,11 @@ func NewSystemDatabase(ctx context.Context, inputs NewSystemDatabaseInput) (Syst
 			return nil, err
 		}
 		if dialectName == DialectSQLite {
-			return newSqliteSystemDatabase(inputs.EncodeScheduledInput, ctx, databaseURL, databaseSchema, nil, logger)
+			systemDB, err := newSqliteSystemDatabase(inputs.EncodeScheduledInput, ctx, databaseURL, databaseSchema, nil, logger)
+			if err != nil {
+				return nil, startupError(ctx, inputs.StartupTimeout, "initializing the SQLite system database", nil, err)
+			}
+			return systemDB, nil
 		}
 	}
 
@@ -758,12 +782,12 @@ func NewSystemDatabase(ctx context.Context, inputs NewSystemDatabaseInput) (Syst
 		// Verify the pool is valid
 		poolConn, err := customPool.Acquire(ctx)
 		if err != nil {
-			return nil, fmt.Errorf("failed to validate custom pool: %v", err)
+			return nil, startupError(ctx, inputs.StartupTimeout, "acquiring a connection from the custom pool", customPool, fmt.Errorf("failed to validate custom pool: %w", err))
 		}
-		defer poolConn.Release()
 		err = poolConn.Ping(ctx)
+		poolConn.Release()
 		if err != nil {
-			return nil, fmt.Errorf("failed to validate custom pool: %v", err)
+			return nil, startupError(ctx, inputs.StartupTimeout, "validating the custom pool", customPool, fmt.Errorf("failed to validate custom pool: %w", err))
 		}
 		pool = customPool
 	} else {
@@ -812,7 +836,7 @@ func NewSystemDatabase(ctx context.Context, inputs NewSystemDatabaseInput) (Syst
 			return createDatabaseIfNotExists(ctx, pool, logger)
 		}, WithRetrierLogger(logger)); err != nil {
 			pool.Close()
-			return nil, fmt.Errorf("failed to create database: %v", err)
+			return nil, startupError(ctx, inputs.StartupTimeout, "connecting to or creating the system database", pool, fmt.Errorf("failed to create database: %w", err))
 		}
 	}
 
@@ -823,7 +847,7 @@ func NewSystemDatabase(ctx context.Context, inputs NewSystemDatabaseInput) (Syst
 		if customPool == nil {
 			pool.Close()
 		}
-		return nil, fmt.Errorf("failed to acquire connection to detect database type: %v", err)
+		return nil, startupError(ctx, inputs.StartupTimeout, "acquiring a connection to detect database type", pool, fmt.Errorf("failed to acquire connection to detect database type: %w", err))
 	}
 	isCockroach := IsCockroachDB(conn.Conn())
 	// Release before any error path calls pool.Close(): Close blocks until all
@@ -838,7 +862,7 @@ func NewSystemDatabase(ctx context.Context, inputs NewSystemDatabaseInput) (Syst
 		if customPool == nil {
 			pool.Close()
 		}
-		return nil, fmt.Errorf("failed to determine migration status: %v", smErr)
+		return nil, startupError(ctx, inputs.StartupTimeout, "checking system database migration status", pool, fmt.Errorf("failed to determine migration status: %w", smErr))
 	}
 	if needsMigration {
 		if err := Retry(ctx, func() error {
@@ -847,7 +871,10 @@ func NewSystemDatabase(ctx context.Context, inputs NewSystemDatabaseInput) (Syst
 			if customPool == nil {
 				pool.Close()
 			}
-			return nil, fmt.Errorf("failed to run migrations: %v", err)
+			if errors.Is(err, context.DeadlineExceeded) {
+				return nil, err
+			}
+			return nil, startupError(ctx, inputs.StartupTimeout, "running system database migrations", pool, fmt.Errorf("failed to run migrations: %w", err))
 		}
 	}
 
@@ -856,7 +883,7 @@ func NewSystemDatabase(ctx context.Context, inputs NewSystemDatabaseInput) (Syst
 		if customPool == nil {
 			pool.Close()
 		}
-		return nil, fmt.Errorf("failed to ping database: %v", err)
+		return nil, startupError(ctx, inputs.StartupTimeout, "pinging the system database", pool, fmt.Errorf("failed to ping database: %w", err))
 	}
 
 	dialect := Dialect(PostgresDialect{})
@@ -869,7 +896,7 @@ func NewSystemDatabase(ctx context.Context, inputs NewSystemDatabaseInput) (Syst
 		dialect:              dialect,
 		RecvNotifier:         newNotifyRegistry(),
 		EventNotifier:        newNotifyRegistry(),
-		streamsMap:           &sync.Map{},
+		streamNotifier:       newNotifyRegistry(),
 		encodeScheduledInput: inputs.EncodeScheduledInput,
 		notificationLoopDone: make(chan struct{}),
 		logger:               logger.With("service", "system_database"),
@@ -896,6 +923,8 @@ func (s *SysDB) SetPool(p Pool) {
 }
 
 func (s *SysDB) Launched() bool {
+	s.notificationLoopMu.Lock()
+	defer s.notificationLoopMu.Unlock()
 	return s.launched
 }
 
@@ -913,27 +942,42 @@ func (s *SysDB) IsContentionError(err error) bool {
 
 func (s *SysDB) StreamWakeChannel(workflowID, key string) (chan struct{}, func()) {
 	payload := fmt.Sprintf("%s::%s", workflowID, key)
-	ch, _ := s.streamsMap.LoadOrStore(payload, make(chan struct{}, 1))
-	return ch.(chan struct{}), func() { s.streamsMap.Delete(payload) }
+	ch := s.streamNotifier.subscribe(payload)
+	return ch, func() { s.streamNotifier.unsubscribe(payload, ch) }
 }
 
 func (s *SysDB) Launch(ctx context.Context) {
-	if s.ListenNotifyPool() == nil {
-		go s.notificationPollerLoop(ctx)
-	} else {
-		go s.notificationListenerLoop(ctx)
-	}
+	done := make(chan struct{})
+	s.notificationLoopMu.Lock()
+	s.notificationLoopDone = done
 	s.launched = true
+	s.notificationLoopMu.Unlock()
+
+	if s.ListenNotifyPool() == nil {
+		go func() {
+			s.notificationPollerLoop(ctx)
+			close(done)
+		}()
+	} else {
+		go func() {
+			s.notificationListenerLoop(ctx)
+			close(done)
+		}()
+	}
 }
 
 func (s *SysDB) Shutdown(ctx context.Context, timeout time.Duration) {
 	s.logger.Debug("Closing system database connection pool")
 
-	if s.launched {
+	s.notificationLoopMu.Lock()
+	launched := s.launched
+	done := s.notificationLoopDone
+	s.notificationLoopMu.Unlock()
+	if launched {
 		// Wait for the notification loop to exit
 		// The context should be cancelled prior to calling shutdown
 		select {
-		case <-s.notificationLoopDone:
+		case <-done:
 		case <-time.After(timeout):
 			s.logger.Warn("Notification listener loop did not finish in time", "timeout", timeout)
 		}
@@ -955,9 +999,11 @@ func (s *SysDB) Shutdown(ctx context.Context, timeout time.Duration) {
 
 	s.RecvNotifier.clear()
 	s.EventNotifier.clear()
-	s.streamsMap.Clear()
+	s.streamNotifier.clear()
 
+	s.notificationLoopMu.Lock()
 	s.launched = false
+	s.notificationLoopMu.Unlock()
 }
 
 /*******************************/
@@ -1160,6 +1206,8 @@ func (s *SysDB) InsertWorkflowStatus(ctx context.Context, input InsertWorkflowSt
 	if ownerXIDReturn != nil {
 		result.OwnerXID = *ownerXIDReturn
 	}
+	ownerXIDMatches := (input.OwnerXID == nil && ownerXIDReturn == nil) ||
+		(input.OwnerXID != nil && ownerXIDReturn != nil && *input.OwnerXID == *ownerXIDReturn)
 	if err != nil {
 		// Handle unique constraint violation for the deduplication ID (this should be the only case)
 		if s.dialect.IsUniqueViolation(err) {
@@ -1192,7 +1240,7 @@ func (s *SysDB) InsertWorkflowStatus(ctx context.Context, input InsertWorkflowSt
 	// Every time we start executing a workflow (and thus attempt to insert its status), we increment `recovery_attempts` by 1.
 	// When this number becomes equal to `maxRetries + 1`, we mark the workflow as `MAX_RECOVERY_ATTEMPTS_EXCEEDED`.
 	if result.Status != models.WorkflowStatusSuccess && result.Status != models.WorkflowStatusError &&
-		input.MaxRetries > 0 && result.Attempts > input.MaxRetries+1 {
+		input.MaxRetries > 0 && result.Attempts > input.MaxRetries+1 && !ownerXIDMatches {
 
 		// Update workflow status to MAX_RECOVERY_ATTEMPTS_EXCEEDED and clear queue-related fields
 		dlqQuery := s.RenderSQL(`UPDATE %sworkflow_status
@@ -3447,7 +3495,6 @@ func (s *SysDB) Patch(ctx context.Context, input PatchDBInput) (bool, error) {
 func (s *SysDB) notificationListenerLoop(ctx context.Context) {
 	defer func() {
 		s.logger.Debug("Notification listener loop exiting")
-		s.notificationLoopDone <- struct{}{}
 	}()
 
 	pgxPool := s.ListenNotifyPool()
@@ -3526,7 +3573,9 @@ func (s *SysDB) notificationListenerLoop(ctx context.Context) {
 						break
 					}
 					s.logger.Debug("failed to re-acquire connection for notification listener", "error", err)
-					time.Sleep(ConnectionRetryBackoff.DelayFor(retryAttempt + 1))
+					if !WaitForRetry(ctx, ConnectionRetryBackoff.DelayFor(retryAttempt+1)) {
+						return
+					}
 					retryAttempt++
 				}
 				// The connection is re-acquired. Wake all waiters so they re-poll the
@@ -3537,7 +3586,9 @@ func (s *SysDB) notificationListenerLoop(ctx context.Context) {
 			}
 			// Other transient errors. Backoff and continue on same conn
 			s.logger.Error("Error waiting for notification", "error", err)
-			time.Sleep(ConnectionRetryBackoff.DelayFor(retryAttempt + 1))
+			if !WaitForRetry(ctx, ConnectionRetryBackoff.DelayFor(retryAttempt+1)) {
+				return
+			}
 			retryAttempt++
 			continue
 		}
@@ -3553,12 +3604,7 @@ func (s *SysDB) notificationListenerLoop(ctx context.Context) {
 		case _DBOS_WORKFLOW_EVENTS_CHANNEL:
 			s.EventNotifier.notify(n.Payload)
 		case _DBOS_STREAMS_CHANNEL:
-			if ch, ok := s.streamsMap.Load(n.Payload); ok {
-				select {
-				case ch.(chan struct{}) <- struct{}{}:
-				default: // A wake-up hint is already pending
-				}
-			}
+			s.streamNotifier.notify(n.Payload)
 		}
 	}
 }
@@ -3566,7 +3612,6 @@ func (s *SysDB) notificationListenerLoop(ctx context.Context) {
 func (s *SysDB) notificationPollerLoop(ctx context.Context) {
 	defer func() {
 		s.logger.Debug("Notification poller loop exiting")
-		s.notificationLoopDone <- struct{}{}
 	}()
 
 	s.logger.Debug("DBOS: Starting notification poller loop")

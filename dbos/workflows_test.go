@@ -1,6 +1,7 @@
 package dbos
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -1719,6 +1720,79 @@ func TestSteps(t *testing.T) {
 			require.Equal(t, recordedName, dbosErr.RecordedName)
 		})
 	})
+
+	t.Run("StepOptionsRetryIntervalDefaults", func(t *testing.T) {
+		tests := []struct {
+			name         string
+			baseInterval time.Duration
+			maxInterval  time.Duration
+			wantBase     time.Duration
+			wantMax      time.Duration
+			wantWarning  bool
+		}{
+			{
+				name:     "both implicit",
+				wantBase: _DEFAULT_STEP_BASE_INTERVAL,
+				wantMax:  _DEFAULT_STEP_MAX_INTERVAL,
+			},
+			{
+				name:         "explicit base below implicit max",
+				baseInterval: time.Second,
+				wantBase:     time.Second,
+				wantMax:      _DEFAULT_STEP_MAX_INTERVAL,
+			},
+			{
+				name:         "explicit base equals implicit max",
+				baseInterval: _DEFAULT_STEP_MAX_INTERVAL,
+				wantBase:     _DEFAULT_STEP_MAX_INTERVAL,
+				wantMax:      _DEFAULT_STEP_MAX_INTERVAL,
+			},
+			{
+				name:         "explicit base exceeds implicit max",
+				baseInterval: 2 * _DEFAULT_STEP_MAX_INTERVAL,
+				wantBase:     2 * _DEFAULT_STEP_MAX_INTERVAL,
+				wantMax:      2 * _DEFAULT_STEP_MAX_INTERVAL,
+				wantWarning:  true,
+			},
+			{
+				name:        "implicit base and explicit max",
+				maxInterval: time.Second,
+				wantBase:    _DEFAULT_STEP_BASE_INTERVAL,
+				wantMax:     time.Second,
+			},
+			{
+				name:         "explicit max below explicit base remains explicit",
+				baseInterval: 2 * time.Second,
+				maxInterval:  time.Second,
+				wantBase:     2 * time.Second,
+				wantMax:      time.Second,
+			},
+			{
+				name:         "explicit max above explicit base",
+				baseInterval: 2 * _DEFAULT_STEP_MAX_INTERVAL,
+				maxInterval:  3 * _DEFAULT_STEP_MAX_INTERVAL,
+				wantBase:     2 * _DEFAULT_STEP_MAX_INTERVAL,
+				wantMax:      3 * _DEFAULT_STEP_MAX_INTERVAL,
+			},
+		}
+
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				var logOutput bytes.Buffer
+				logger := slog.New(slog.NewTextHandler(&logOutput, nil))
+				opts := stepOptions{
+					baseInterval: tt.baseInterval,
+					maxInterval:  tt.maxInterval,
+				}
+
+				opts.setDefaults(logger)
+
+				require.Equal(t, tt.wantBase, opts.baseInterval)
+				require.Equal(t, tt.wantMax, opts.maxInterval)
+				require.Equal(t, tt.wantWarning, strings.Contains(logOutput.String(), "increasing max interval"))
+			})
+		}
+	})
 }
 
 func stepReturningStepID(ctx context.Context) (int, error) {
@@ -3161,6 +3235,59 @@ func TestWorkflowDeadLetterQueue(t *testing.T) {
 	RegisterWorkflow(dbosCtx, deadLetterQueueWorkflow, WithMaxRetries(maxRecoveryAttempts))
 	RegisterWorkflow(dbosCtx, infiniteDeadLetterQueueWorkflow, WithMaxRetries(-1)) // A negative value means infinite retries
 	dbosCtx.Launch()
+
+	t.Run("DatabaseRetryWithSameOwnerDoesNotDeadLetter", func(t *testing.T) {
+		sysDB := dbosCtx.(*dbosContext).systemDB.(*sysdb.SysDB)
+		workflowID := uuid.NewString()
+		status := models.WorkflowStatus{
+			ID:            workflowID,
+			Status:        models.WorkflowStatusPending,
+			Name:          "dead-letter-owner-test",
+			ExecutorID:    "local",
+			CreatedAt:     time.Now(),
+			Serialization: "DBOS_JSON",
+		}
+
+		insert := func(ownerXID string, incrementAttempts bool, maxRetries int) (*sysdb.InsertWorkflowResult, error) {
+			tx, err := sysDB.Pool().BeginTx(context.Background(), TxOptions{})
+			require.NoError(t, err)
+			defer tx.Rollback(context.Background())
+			result, err := sysDB.InsertWorkflowStatus(context.Background(), sysdb.InsertWorkflowStatusDBInput{
+				Status:            status,
+				MaxRetries:        maxRetries,
+				Tx:                tx,
+				OwnerXID:          &ownerXID,
+				IncrementAttempts: incrementAttempts,
+			})
+			if err != nil {
+				return nil, err
+			}
+			require.NoError(t, tx.Commit(context.Background()))
+			return result, nil
+		}
+
+		_, err := insert("initial-owner", false, 1)
+		require.NoError(t, err)
+		result, err := insert("recovery-owner-1", true, 100)
+		require.NoError(t, err)
+		require.Equal(t, 2, result.Attempts)
+		result, err = insert("recovery-owner-2", true, 100)
+		require.NoError(t, err)
+		require.Equal(t, 3, result.Attempts)
+
+		// Replay the original initialization after a lost commit acknowledgement.
+		// Concurrent recoveries raised the counter, but this replay is not a new
+		// recovery attempt and must not dead-letter the workflow.
+		result, err = insert("initial-owner", false, 1)
+		require.NoError(t, err)
+		require.Equal(t, 3, result.Attempts)
+		require.Equal(t, models.WorkflowStatusPending, result.Status)
+
+		// A genuinely new recovery owner is a new attempt and may dead-letter.
+		_, err = insert("next-recovery-owner", true, 1)
+		require.Error(t, err)
+		require.ErrorIs(t, err, &DBOSError{Code: DeadLetterQueueError})
+	})
 
 	t.Run("DeadLetterQueueBehavior", func(t *testing.T) {
 		recoveryCount = 0

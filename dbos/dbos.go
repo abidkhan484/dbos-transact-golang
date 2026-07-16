@@ -26,9 +26,11 @@ import (
 )
 
 const (
-	_DEFAULT_ADMIN_SERVER_PORT = 3001
-	_DEFAULT_SYSTEM_DB_SCHEMA  = "dbos"
-	_DBOS_DOMAIN               = "cloud.dbos.dev"
+	_DEFAULT_ADMIN_SERVER_PORT         = 3001
+	_DEFAULT_SYSTEM_DB_SCHEMA          = "dbos"
+	_DEFAULT_SYSTEM_DB_STARTUP_TIMEOUT = 2 * time.Minute
+	_DBOS_DOMAIN                       = "cloud.dbos.dev"
+	_LAUNCH_ROLLBACK_TIMEOUT           = 30 * time.Second
 )
 
 // Config holds configuration parameters for initializing a DBOS context.
@@ -50,6 +52,7 @@ type Config struct {
 	EnablePatching            bool            // Enable the patching system for Patch and DeprecatePatch (default: false)
 	Serializer                Serializer[any] // Custom serializer for encoding/decoding workflow inputs, outputs, and events (defaults to JSON serializer)
 	SchedulerPollingInterval  time.Duration   // controls how often dynamic schedules are reconciled with the database (defaults to 30 seconds)
+	SystemDBStartupTimeout    time.Duration   // Maximum time for system-database connection and migrations (defaults to 2 minutes)
 }
 
 func processConfig(inputConfig *Config) (*Config, error) {
@@ -71,6 +74,9 @@ func processConfig(inputConfig *Config) (*Config, error) {
 	if inputConfig.AdminServerPort == 0 {
 		inputConfig.AdminServerPort = _DEFAULT_ADMIN_SERVER_PORT
 	}
+	if inputConfig.SystemDBStartupTimeout < 0 {
+		return nil, fmt.Errorf("systemDBStartupTimeout cannot be negative")
+	}
 
 	dbosConfig := &Config{
 		DatabaseURL:               inputConfig.DatabaseURL,
@@ -89,6 +95,7 @@ func processConfig(inputConfig *Config) (*Config, error) {
 		EnablePatching:            inputConfig.EnablePatching,
 		Serializer:                inputConfig.Serializer,
 		SchedulerPollingInterval:  inputConfig.SchedulerPollingInterval,
+		SystemDBStartupTimeout:    inputConfig.SystemDBStartupTimeout,
 	}
 
 	if dbosConfig.ConductorExecutorMetadata != nil {
@@ -103,6 +110,9 @@ func processConfig(inputConfig *Config) (*Config, error) {
 	}
 	if dbosConfig.DatabaseSchema == "" {
 		dbosConfig.DatabaseSchema = _DEFAULT_SYSTEM_DB_SCHEMA
+	}
+	if dbosConfig.SystemDBStartupTimeout == 0 {
+		dbosConfig.SystemDBStartupTimeout = _DEFAULT_SYSTEM_DB_STARTUP_TIMEOUT
 	}
 
 	// If patching is enabled and application version is not set, fix the application version
@@ -229,13 +239,17 @@ type dbosContext struct {
 	ctxCancelFunc context.CancelCauseFunc
 
 	launched atomic.Bool
+	// Launch and shutdown are permanent, one-shot lifecycle transitions.
+	launchStarted   atomic.Bool
+	shutdownStarted atomic.Bool
 
 	systemDB    sysdb.SystemDatabase
 	adminServer *adminServer
 	config      *Config
 
 	// Queue runner
-	queueRunner *queueRunner
+	queueRunner        *queueRunner
+	queueRunnerStarted atomic.Bool
 
 	// Conductor client
 	conductor *conductor
@@ -256,7 +270,9 @@ type dbosContext struct {
 	activeWorkflowIDs *sync.Map
 
 	// Workflow scheduler
-	workflowScheduler *cron.Cron
+	workflowScheduler        *cron.Cron
+	workflowSchedulerStarted atomic.Bool
+	scheduleReconcilerWg     sync.WaitGroup
 
 	scheduleMu sync.Mutex
 	// Schedule entry ID mapping (scheduleName -> cron.EntryID)
@@ -436,11 +452,6 @@ func WithTimeout(ctx DBOSContext, timeout time.Duration) (DBOSContext, context.C
 }
 
 func (c *dbosContext) getWorkflowScheduler() *cron.Cron {
-	if c.workflowScheduler == nil {
-		c.workflowScheduler = cron.New(cron.WithSeconds())
-		c.scheduleEntryIDs = make(map[string]cron.EntryID)
-		c.scheduleInstalledSignatures = make(map[string]scheduleSignature)
-	}
 	return c.workflowScheduler
 }
 
@@ -516,12 +527,15 @@ func (c *dbosContext) ListRegisteredWorkflows(_ DBOSContext, opts ...ListRegiste
 func NewDBOSContext(ctx context.Context, inputConfig Config) (DBOSContext, error) {
 	dbosBaseCtx, cancelFunc := context.WithCancelCause(ctx)
 	initExecutor := &dbosContext{
-		workflowsWg:             &sync.WaitGroup{},
-		ctx:                     dbosBaseCtx,
-		ctxCancelFunc:           cancelFunc,
-		workflowRegistry:        &sync.Map{},
-		workflowCustomNametoFQN: &sync.Map{},
-		activeWorkflowIDs:       &sync.Map{},
+		workflowsWg:                 &sync.WaitGroup{},
+		ctx:                         dbosBaseCtx,
+		ctxCancelFunc:               cancelFunc,
+		workflowRegistry:            &sync.Map{},
+		workflowCustomNametoFQN:     &sync.Map{},
+		activeWorkflowIDs:           &sync.Map{},
+		workflowScheduler:           cron.New(cron.WithSeconds()),
+		scheduleEntryIDs:            make(map[string]cron.EntryID),
+		scheduleInstalledSignatures: make(map[string]scheduleSignature),
 	}
 
 	// Load and process the configuration
@@ -559,8 +573,12 @@ func NewDBOSContext(ctx context.Context, inputConfig Config) (DBOSContext, error
 		},
 	}
 
-	// Create the system database
-	systemDB, err := sysdb.NewSystemDatabase(initExecutor, newSystemDatabaseInputs)
+	// Create the system database within a bounded startup window. This covers
+	// pool acquisition, database creation, migrations, and the final ping.
+	startupCtx, cancelStartup := context.WithTimeout(initExecutor, config.SystemDBStartupTimeout)
+	defer cancelStartup()
+	newSystemDatabaseInputs.StartupTimeout = config.SystemDBStartupTimeout
+	systemDB, err := sysdb.NewSystemDatabase(startupCtx, newSystemDatabaseInputs)
 	if err != nil {
 		initExecutor.logger.Error("failed to create system database", "error", err)
 		return nil, models.NewInitializationError(err.Error())
@@ -627,9 +645,15 @@ func NewDBOSContext(ctx context.Context, inputConfig Config) (DBOSContext, error
 //
 // Returns an error if the context is already launched or if any component fails to start.
 func (c *dbosContext) Launch() error {
-	if c.launched.Load() {
+	if !c.launchStarted.CompareAndSwap(false, true) {
 		return models.NewInitializationError("DBOS is already launched")
 	}
+	launchCompleted := false
+	defer func() {
+		if !launchCompleted {
+			c.Shutdown(_LAUNCH_ROLLBACK_TIMEOUT)
+		}
+	}()
 
 	// Start the system database
 	c.systemDB.Launch(c)
@@ -650,29 +674,34 @@ func (c *dbosContext) Launch() error {
 
 	// Start the admin server if enabled
 	if c.config.AdminServer {
-		adminServer := newAdminServer(c, c.config.AdminServerPort)
-		err := adminServer.Start()
+		c.adminServer = newAdminServer(c, c.config.AdminServerPort)
+		err := c.adminServer.Start()
 		if err != nil {
 			c.logger.Error("Failed to start admin server", "error", err)
 			return models.NewInitializationError(fmt.Sprintf("failed to start admin server: %v", err))
 		}
 		c.logger.Debug("Admin server started", "port", c.config.AdminServerPort)
-		c.adminServer = adminServer
 	}
 
 	// Start the queue runner in a goroutine
 	go func() {
 		c.queueRunner.run(c)
 	}()
+	c.queueRunnerStarted.Store(true)
 	c.logger.Debug("Queue runner started")
 
 	// Start the cron scheduler.
 	c.getWorkflowScheduler().Start()
+	c.workflowSchedulerStarted.Store(true)
 	c.logger.Debug("Workflow scheduler started")
 
 	// Start the dynamic schedule reconciler. It polls the schedules table every
 	// _SCHEDULE_POLL_INTERVAL and reconciles cron entries against DB state.
-	go c.runScheduleReconciler()
+	c.scheduleReconcilerWg.Add(1)
+	go func() {
+		defer c.scheduleReconcilerWg.Done()
+		c.runScheduleReconciler()
+	}()
 
 	// Start the conductor if it has been initialized
 	if c.conductor != nil {
@@ -693,6 +722,7 @@ func (c *dbosContext) Launch() error {
 
 	c.logger.Info("DBOS launched", "app_version", c.applicationVersion, "executor_id", c.executorID)
 	c.launched.Store(true)
+	launchCompleted = true
 	return nil
 }
 
@@ -712,6 +742,9 @@ func (c *dbosContext) Launch() error {
 //
 // Shutdown is a permanent operation and should be called when the application is terminating.
 func (c *dbosContext) Shutdown(timeout time.Duration) {
+	if !c.shutdownStarted.CompareAndSwap(false, true) {
+		return
+	}
 	c.logger.Debug("Shutting down DBOS context")
 
 	// Cancel the context to signal all resources to stop
@@ -720,27 +753,39 @@ func (c *dbosContext) Shutdown(timeout time.Duration) {
 	// Stop workflow producers before draining in-flight workflows. Producers
 	// (.e.g, queue runner) call RunWorkflow, which calls workflowsWg.Add(1);
 	// waiting on the WaitGroup before they finish races with those Adds.
+	reconcilerDone := make(chan struct{})
+	go func() {
+		c.scheduleReconcilerWg.Wait()
+		close(reconcilerDone)
+	}()
+	select {
+	case <-reconcilerDone:
+		c.logger.Debug("Schedule reconciler completed")
+	case <-time.After(timeout):
+		c.logger.Warn("Timeout waiting for schedule reconciler to complete", "timeout", timeout)
+	}
 
 	// Wait for queue runner to finish
-	if c.queueRunner != nil && c.launched.Load() {
+	if c.queueRunner != nil && c.queueRunnerStarted.Load() {
 		c.logger.Debug("Waiting for queue runner to complete")
 		select {
 		case <-c.queueRunner.completionChan:
 			c.logger.Debug("Queue runner completed")
+			c.queueRunnerStarted.Store(false)
 		case <-time.After(timeout):
 			c.logger.Warn("Timeout waiting for queue runner to complete", "timeout", timeout)
 		}
 	}
 
 	// Stop the workflow scheduler and wait until all scheduled workflows are done
-	if c.workflowScheduler != nil && c.launched.Load() {
+	if c.workflowScheduler != nil && c.workflowSchedulerStarted.Load() {
 		c.logger.Debug("Stopping workflow scheduler")
 		ctx := c.workflowScheduler.Stop()
+		c.workflowSchedulerStarted.Store(false)
 
 		select {
 		case <-ctx.Done():
 			c.logger.Debug("All scheduled jobs completed")
-			c.workflowScheduler = nil
 		case <-time.After(timeout):
 			c.logger.Warn("Timeout waiting for jobs to complete. Moving on", "timeout", timeout)
 		}
@@ -753,7 +798,7 @@ func (c *dbosContext) Shutdown(timeout time.Duration) {
 	}
 
 	// Shutdown the admin server
-	if c.adminServer != nil && c.launched.Load() {
+	if c.adminServer != nil {
 		c.logger.Debug("Shutting down admin server")
 		err := c.adminServer.Shutdown(timeout)
 		if err != nil {
