@@ -35,14 +35,15 @@ type SystemDatabase interface {
 	// IsContentionError reports whether err is a lock/serialization contention
 	// error for the active backend. See Dialect.IsContentionError.
 	IsContentionError(err error) bool
-	Shutdown(ctx context.Context, timeout time.Duration)
+	// Shutdown returns the names of sub-components still running when timeout expired.
+	Shutdown(ctx context.Context, timeout time.Duration) []string
 	ResetSystemDB(ctx context.Context) error
 
 	// Workflows
 	InsertWorkflowStatus(ctx context.Context, input InsertWorkflowStatusDBInput) (*InsertWorkflowResult, error)
 	ListWorkflows(ctx context.Context, input ListWorkflowsDBInput) ([]models.WorkflowStatus, error)
 	UpdateWorkflowOutcome(ctx context.Context, input UpdateWorkflowOutcomeDBInput) error
-	UpdateWorkflowAttributes(ctx context.Context, input UpdateWorkflowAttributesDBInput) error
+	SetWorkflowAttributes(ctx context.Context, input SetWorkflowAttributesDBInput) error
 	AwaitWorkflowResult(ctx context.Context, workflowID string, pollInterval time.Duration) (*AwaitWorkflowResultOutput, error)
 	CancelWorkflows(ctx context.Context, input CancelWorkflowsDBInput) ([]string, error)
 	CancelAllBefore(ctx context.Context, cutoffTime time.Time) error
@@ -151,7 +152,7 @@ type SysDB struct {
 	EventNotifier        *notifyRegistry // getEvent waiters, keyed by "targetWorkflowID::key"
 	streamNotifier       *notifyRegistry // stream readers, keyed by "workflowID::key"
 	logger               *slog.Logger
-	encodeScheduledInput func(ctx context.Context, scheduledTime time.Time, scheduleContext any) (*string, string, error)
+	encodeScheduledInput func(ctx context.Context, scheduledTime time.Time, scheduleContext json.RawMessage) (*string, string, error)
 	schema               string
 	launched             bool
 	isCockroachDB        bool
@@ -711,7 +712,7 @@ type NewSystemDatabaseInput struct {
 	// EncodeScheduledInput serializes the input of a schedule-created workflow
 	// (backfill/trigger). Injected by the caller to keep serialization concerns
 	// out of the system database.
-	EncodeScheduledInput func(ctx context.Context, scheduledTime time.Time, scheduleContext any) (encoded *string, serialization string, err error)
+	EncodeScheduledInput func(ctx context.Context, scheduledTime time.Time, scheduleContext json.RawMessage) (encoded *string, serialization string, err error)
 }
 
 func startupError(ctx context.Context, timeout time.Duration, phase string, pool *pgxpool.Pool, err error) error {
@@ -966,13 +967,15 @@ func (s *SysDB) Launch(ctx context.Context) {
 	}
 }
 
-func (s *SysDB) Shutdown(ctx context.Context, timeout time.Duration) {
+func (s *SysDB) Shutdown(ctx context.Context, timeout time.Duration) []string {
 	s.logger.Debug("Closing system database connection pool")
+	var pending []string
 
 	s.notificationLoopMu.Lock()
 	launched := s.launched
 	done := s.notificationLoopDone
 	s.notificationLoopMu.Unlock()
+	listenerStopped := true
 	if launched {
 		// Wait for the notification loop to exit
 		// The context should be cancelled prior to calling shutdown
@@ -980,6 +983,8 @@ func (s *SysDB) Shutdown(ctx context.Context, timeout time.Duration) {
 		case <-done:
 		case <-time.After(timeout):
 			s.logger.Warn("Notification listener loop did not finish in time", "timeout", timeout)
+			pending = append(pending, "notification listener")
+			listenerStopped = false
 		}
 	}
 
@@ -994,6 +999,7 @@ func (s *SysDB) Shutdown(ctx context.Context, timeout time.Duration) {
 		case <-poolClose:
 		case <-time.After(timeout):
 			s.logger.Warn("System database connection pool did not close in time", "timeout", timeout)
+			pending = append(pending, "connection pool")
 		}
 	}
 
@@ -1002,8 +1008,13 @@ func (s *SysDB) Shutdown(ctx context.Context, timeout time.Duration) {
 	s.streamNotifier.clear()
 
 	s.notificationLoopMu.Lock()
-	s.launched = false
+	// Stay launched while the notification loop is still running so a later
+	// Shutdown call waits for it again instead of skipping the check.
+	if listenerStopped {
+		s.launched = false
+	}
 	s.notificationLoopMu.Unlock()
+	return pending
 }
 
 /*******************************/
@@ -1231,10 +1242,10 @@ func (s *SysDB) InsertWorkflowStatus(ctx context.Context, input InsertWorkflowSt
 	}
 
 	if len(input.Status.Name) > 0 && result.Name != input.Status.Name {
-		return nil, models.NewConflictingWorkflowError(input.Status.ID, fmt.Sprintf("Workflow already exists with a different name: %s, but the provided name is: %s", result.Name, input.Status.Name))
+		return nil, models.NewUnexpectedWorkflowError(input.Status.ID, fmt.Sprintf("Workflow already exists with a different name: %s, but the provided name is: %s", result.Name, input.Status.Name))
 	}
 	if len(input.Status.QueueName) > 0 && result.QueueName != nil && input.Status.QueueName != *result.QueueName {
-		return nil, models.NewConflictingWorkflowError(input.Status.ID, fmt.Sprintf("Workflow already exists in a different queue: %s, but the provided queue is: %s", *result.QueueName, input.Status.QueueName))
+		return nil, models.NewUnexpectedWorkflowError(input.Status.ID, fmt.Sprintf("Workflow already exists in a different queue: %s, but the provided queue is: %s", *result.QueueName, input.Status.QueueName))
 	}
 
 	// Every time we start executing a workflow (and thus attempt to insert its status), we increment `recovery_attempts` by 1.
@@ -1624,14 +1635,14 @@ type UpdateWorkflowOutcomeDBInput struct {
 	Tx         Tx
 }
 
-// UpdateWorkflowOutcome records a workflow's terminal outcome. Only a PENDING row can
-// receive an outcome: any other status means the run was superseded (already terminal,
-// re-enqueued by a resume, ...). If the write is refused for any reason other than the workflow having
-// completed (SUCCESS/ERROR), returns a models.WorkflowCancelled error.
+// UpdateWorkflowOutcome records a workflow's terminal outcome. The write is refused
+// when the row is already terminal (CANCELLED/SUCCESS/ERROR). A refusal is an error
+// only when the workflow was cancelled, so the caller ends as cancelled instead of
+// reporting a completion that was never recorded; other refusals are silent no-ops.
 func (s *SysDB) UpdateWorkflowOutcome(ctx context.Context, input UpdateWorkflowOutcomeDBInput) error {
 	query := s.RenderSQL(`UPDATE %sworkflow_status
 			  SET status = $1, output = $2, error = $3, updated_at = $4, completed_at = $4, deduplication_id = NULL
-			  WHERE workflow_uuid = $5 AND status = $6`, s.dialect.SchemaPrefix(s.schema))
+			  WHERE workflow_uuid = $5 AND status NOT IN ($6, $7, $8)`, s.dialect.SchemaPrefix(s.schema))
 
 	var runner Querier = s.pool
 	if input.Tx != nil {
@@ -1639,7 +1650,7 @@ func (s *SysDB) UpdateWorkflowOutcome(ctx context.Context, input UpdateWorkflowO
 	}
 
 	// input.output is already a *string from the database layer
-	res, err := runner.Exec(ctx, query, input.Status, input.Output, input.ErrStr, time.Now().UnixMilli(), input.WorkflowID, models.WorkflowStatusPending)
+	res, err := runner.Exec(ctx, query, input.Status, input.Output, input.ErrStr, time.Now().UnixMilli(), input.WorkflowID, models.WorkflowStatusCancelled, models.WorkflowStatusSuccess, models.WorkflowStatusError)
 	if err != nil {
 		return fmt.Errorf("failed to update workflow status: %w", err)
 	}
@@ -1649,9 +1660,7 @@ func (s *SysDB) UpdateWorkflowOutcome(ctx context.Context, input UpdateWorkflowO
 	}
 	if rowsAffected == 0 {
 		// The guarded UPDATE matched no rows. Re-read the status (only on this rare
-		// no-op path): if the workflow completed (SUCCESS/ERROR) the refusal is a
-		// no-op; otherwise the run was cancelled or superseded and is reported as
-		// cancelled to the caller.
+		// no-op path): only a cancelled workflow surfaces an error to the caller.
 		statusQuery := s.RenderSQL(`SELECT status FROM %sworkflow_status WHERE workflow_uuid = $1`, s.dialect.SchemaPrefix(s.schema))
 		var currentStatus models.WorkflowStatusType
 		if err := runner.QueryRow(ctx, statusQuery, input.WorkflowID).Scan(&currentStatus); err != nil {
@@ -1660,23 +1669,23 @@ func (s *SysDB) UpdateWorkflowOutcome(ctx context.Context, input UpdateWorkflowO
 			}
 			return fmt.Errorf("failed to read workflow status after refused outcome update: %w", err)
 		}
-		if currentStatus != models.WorkflowStatusSuccess && currentStatus != models.WorkflowStatusError {
+		if currentStatus == models.WorkflowStatusCancelled {
 			return models.NewWorkflowCancelledError(input.WorkflowID, nil)
 		}
 	}
 	return nil
 }
 
-type UpdateWorkflowAttributesDBInput struct {
+type SetWorkflowAttributesDBInput struct {
 	WorkflowID string
 	Attributes map[string]any
 	Tx         Tx
 }
 
-// UpdateWorkflowAttributes replaces the custom attributes attached to an existing
+// SetWorkflowAttributes replaces the custom attributes attached to an existing
 // workflow. A nil/empty attributes map clears them (stored as NULL). Returns a
 // non-existent workflow error if no workflow with the given ID exists.
-func (s *SysDB) UpdateWorkflowAttributes(ctx context.Context, input UpdateWorkflowAttributesDBInput) error {
+func (s *SysDB) SetWorkflowAttributes(ctx context.Context, input SetWorkflowAttributesDBInput) error {
 	var attributesJSON *string
 	if len(input.Attributes) > 0 {
 		marshaled, err := json.Marshal(input.Attributes)
@@ -2583,9 +2592,9 @@ type RecordOperationResultDBInput struct {
 // existing at (workflow_uuid, function_id) is disambiguated by content:
 //   - identical to input (including the caller's timestamps) → our own earlier
 //     write whose commit ack was lost; the retry is a no-op success.
-//   - different function name → determinism violation (UnexpectedStep).
+//   - different function name → determinism violation (ErrorCodeUnexpectedStep).
 //   - anything else → a concurrent execution of this workflow checkpointed the
-//     step first → ConflictingIDError. Callers must surface it as the step
+//     step first → ErrorCodeConflictingID. Callers must surface it as the step
 //     error so the workflow-level handler parks this run in polling mode
 //     rather than racing the other execution step by step.
 //
@@ -4395,14 +4404,16 @@ func (s *SysDB) DequeueWorkflows(ctx context.Context, input DequeueWorkflowsInpu
 	}
 
 	// Calculate max_tasks based on concurrency limits
-	maxTasks := input.Queue.MaxTasksPerIteration
-
+	// maxTasks < 0 means this dequeue is unbounded.
+	maxTasks := -1
 	if input.Queue.WorkerConcurrency != nil {
 		workerConcurrency := *input.Queue.WorkerConcurrency
 		if input.LocalRunningCount > workerConcurrency {
 			s.logger.Warn("Local running workflows on queue exceeds worker concurrency limit", "local_running", input.LocalRunningCount, "queue_name", input.Queue.Name, "concurrency_limit", workerConcurrency)
 		}
-		maxTasks = max(workerConcurrency-input.LocalRunningCount, 0)
+		if available := max(workerConcurrency-input.LocalRunningCount, 0); maxTasks < 0 || available < maxTasks {
+			maxTasks = available
+		}
 	}
 
 	if input.Queue.GlobalConcurrency != nil {
@@ -4426,13 +4437,12 @@ func (s *SysDB) DequeueWorkflows(ctx context.Context, input DequeueWorkflowsInpu
 		if globalCount > concurrency {
 			s.logger.Warn("Total pending workflows on queue exceeds global concurrency limit", "total_pending", globalCount, "queue_name", input.Queue.Name, "concurrency_limit", concurrency)
 		}
-		availableTasks := max(concurrency-globalCount, 0)
-		if availableTasks < maxTasks {
+		if availableTasks := max(concurrency-globalCount, 0); maxTasks < 0 || availableTasks < maxTasks {
 			maxTasks = availableTasks
 		}
 	}
 
-	if maxTasks <= 0 {
+	if maxTasks == 0 {
 		return nil, nil
 	}
 
@@ -4443,7 +4453,7 @@ func (s *SysDB) DequeueWorkflows(ctx context.Context, input DequeueWorkflowsInpu
 	switch latest, err := s.GetLatestApplicationVersion(ctx, tx); {
 	case err == nil:
 		isLatestVersion = latest.Name == input.ApplicationVersion
-	case errors.Is(err, &models.DBOSError{Code: models.NoApplicationVersions}):
+	case errors.Is(err, &models.Error{Code: models.ErrorCodeNoApplicationVersions}):
 		// No versions registered yet: treat this worker as the latest.
 	default:
 		return nil, fmt.Errorf("failed to query latest application version: %w", err)
@@ -4647,13 +4657,12 @@ func scanQueueRow(row Row) (*models.QueueConfig, error) {
 		return nil, err
 	}
 	q := &models.QueueConfig{
-		Name:                 name,
-		GlobalConcurrency:    concurrency,
-		WorkerConcurrency:    workerConcurrency,
-		PriorityEnabled:      priorityEnabled,
-		PartitionQueue:       partitionQueue,
-		MaxTasksPerIteration: models.DefaultMaxTasksPerIteration, // not persisted; queue table has no such column
-		DatabaseBacked:       true,
+		Name:              name,
+		GlobalConcurrency: concurrency,
+		WorkerConcurrency: workerConcurrency,
+		PriorityEnabled:   priorityEnabled,
+		PartitionQueue:    partitionQueue,
+		DatabaseBacked:    true,
 	}
 	if rateLimitMax != nil {
 		var period time.Duration
@@ -5190,8 +5199,8 @@ func (s *SysDB) ListSchedules(ctx context.Context, input ListSchedulesDBInput) (
 					"schedule_name", schedule.ScheduleName, "last_fired_at", *lastFiredAtStr, "error", err)
 			}
 		}
-		if err := json.Unmarshal([]byte(contextJSON), &schedule.Context); err != nil {
-			schedule.Context = contextJSON
+		if raw := strings.TrimSpace(contextJSON); raw != "" && raw != "null" {
+			schedule.Context = json.RawMessage(contextJSON)
 		}
 
 		schedules = append(schedules, schedule)
