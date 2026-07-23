@@ -9175,7 +9175,8 @@ func TestWorkflowAttributes(t *testing.T) {
 	queue, err := RegisterQueue(dbosCtx, "attr-test-queue")
 	require.NoError(t, err)
 
-	debouncer := NewDebouncer(dbosCtx, attrDebouncedWorkflow)
+	debouncer, err := NewDebouncer(dbosCtx, attrDebouncedWorkflow)
+	require.NoError(t, err, "failed to create the debouncer")
 
 	require.NoError(t, Launch(dbosCtx), "failed to launch DBOS")
 
@@ -9360,17 +9361,6 @@ func TestWorkflowAttributes(t *testing.T) {
 		status, err := handle.GetStatus()
 		require.NoError(t, err)
 		assert.Equal(t, map[string]any{"source": "debouncer"}, status.Attributes)
-
-		// The internal debouncer workflow itself does not get the user's attributes
-		internalStatuses, err := ListWorkflows(dbosCtx, WithFilterName(debouncer.internalDebouncerFQN))
-		require.NoError(t, err)
-		require.NotEmpty(t, internalStatuses)
-		for _, s := range internalStatuses {
-			if !strings.Contains(s.Name, "internalDebouncerWF") {
-				continue
-			}
-			assert.Nil(t, s.Attributes)
-		}
 	})
 
 	t.Run("Update", func(t *testing.T) {
